@@ -8,7 +8,8 @@ export interface Env {
   YOUTUBE_SEARCH_KEY_2?: string;
   YOUTUBE_SEARCH_KEY_3?: string;
   OPENAI_API_KEY?: string;
-  GROQ_API_KEY?: string;
+  GROQ_API_KEY_1?: string;
+  GROQ_API_KEY_2?: string;
   // Clé pour sécuriser les routes d'écriture depuis l'app
   API_SECRET?: string;
 }

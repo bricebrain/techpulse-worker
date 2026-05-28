@@ -1,6 +1,7 @@
 import type { Env, Source } from './types';
 import { runCron } from './cron';
 import { json, err, isAuthorized } from './utils';
+import { adminPage } from './admin';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -23,6 +24,11 @@ export default {
           'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         },
       });
+    }
+
+    // ── GET /admin — page d'administration ───────────────────────────────
+    if (method === 'GET' && path === '/admin') {
+      return adminPage();
     }
 
     // ── GET /articles?theme=youtube&limit=30 ─────────────────────────────
@@ -80,6 +86,32 @@ export default {
       ).bind(id, body.name, body.theme, body.type, body.value, limit, now, now).run();
 
       return json({ id, message: 'Source créée' }, 201);
+    }
+
+    // ── POST /sources/sync — upsert bulk depuis l'app mobile ─────────────
+    if (method === 'POST' && path === '/sources/sync') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const body = await req.json<{ sources?: Partial<Source>[] }>().catch(() => null);
+      const list = body?.sources ?? [];
+      if (!list.length) return json({ synced: 0 });
+
+      const now = new Date().toISOString();
+      const stmts = list
+        .filter((s) => s.id && s.name && s.theme && s.type && s.value)
+        .map((s) =>
+          env.DB.prepare(
+            `INSERT INTO sources (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               name        = excluded.name,
+               limit_count = excluded.limit_count,
+               updated_at  = excluded.updated_at`
+          ).bind(s.id, s.name, s.theme, s.type, s.value, s.limit_count ?? 5, now, now)
+        );
+
+      await env.DB.batch(stmts);
+      return json({ synced: stmts.length });
     }
 
     // ── PUT /sources/:id ──────────────────────────────────────────────────
