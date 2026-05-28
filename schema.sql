@@ -14,14 +14,15 @@ CREATE TABLE IF NOT EXISTS sources (
 
 -- Articles pré-fetchés par le cron
 CREATE TABLE IF NOT EXISTS articles (
-  hash         TEXT PRIMARY KEY,
-  theme        TEXT NOT NULL,
-  title        TEXT NOT NULL,
-  source_name  TEXT NOT NULL,
-  url          TEXT,
-  content      TEXT,
-  published_at INTEGER,
-  fetched_at   INTEGER NOT NULL
+  hash             TEXT PRIMARY KEY,
+  theme            TEXT NOT NULL,
+  classified_theme TEXT,             -- thème détecté par Workers AI (peut différer de theme)
+  title            TEXT NOT NULL,
+  source_name      TEXT NOT NULL,
+  url              TEXT,
+  content          TEXT,
+  published_at     INTEGER,
+  fetched_at       INTEGER NOT NULL
 );
 
 -- Config dynamique (clés feature flag, valeurs ajustables sans rebuild)

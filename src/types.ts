@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  AI: Ai;
   // Secrets (définis via `wrangler secret put`)
   YOUTUBE_API_KEY_1?: string;
   YOUTUBE_API_KEY_2?: string;

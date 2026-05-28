@@ -35,26 +35,47 @@ export default {
       return handleProxy(req, env, pathAfterProxy);
     }
 
+    // ── POST /classify/test — test Workers AI sur un titre ───────────────
+    if (method === 'POST' && path === '/classify/test') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const body = await req.json<{ title?: string; content?: string }>().catch(() => null);
+      const { classifyArticle } = await import('./classifier');
+      const theme = await classifyArticle(env.AI, {
+        title:   body?.title   ?? 'React Native new architecture and Expo performance tips',
+        content: body?.content ?? '',
+      });
+      return json({ classified_theme: theme });
+    }
+
     // ── GET /admin — page d'administration ───────────────────────────────
     if (method === 'GET' && path === '/admin') {
       return adminPage();
     }
 
-    // ── GET /articles?theme=youtube&limit=30 ─────────────────────────────
+    // ── GET /articles?theme=youtube&limit=30&classified=ai ───────────────
     if (method === 'GET' && path === '/articles') {
-      const theme = url.searchParams.get('theme');
-      const limit = Math.min(Number(url.searchParams.get('limit') ?? '50'), 100);
+      const theme      = url.searchParams.get('theme');
+      const classified = url.searchParams.get('classified'); // filtre optionnel sur classified_theme
+      const limit      = Math.min(Number(url.searchParams.get('limit') ?? '50'), 100);
 
       if (!theme) return err('Paramètre theme requis');
 
-      const { results } = await env.DB.prepare(
-        `SELECT * FROM articles
-         WHERE theme = ?
-         ORDER BY published_at DESC, fetched_at DESC
-         LIMIT ?`
-      ).bind(theme, limit).all();
+      // Si ?classified=ai → articles YouTube classifiés comme IA
+      const { results } = classified
+        ? await env.DB.prepare(
+            `SELECT * FROM articles
+             WHERE theme = ? AND classified_theme = ?
+             ORDER BY published_at DESC, fetched_at DESC
+             LIMIT ?`
+          ).bind(theme, classified, limit).all()
+        : await env.DB.prepare(
+            `SELECT * FROM articles
+             WHERE theme = ?
+             ORDER BY published_at DESC, fetched_at DESC
+             LIMIT ?`
+          ).bind(theme, limit).all();
 
-      return json({ articles: results, theme, count: results.length });
+      return json({ articles: results, theme, classified: classified ?? null, count: results.length });
     }
 
     // ── GET /articles/themes — liste des thèmes disponibles ──────────────

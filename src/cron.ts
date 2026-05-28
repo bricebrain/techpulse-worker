@@ -2,6 +2,7 @@ import type { Env, Source, Article } from './types';
 import { fetchRss } from './fetchers/rss';
 import { fetchReddit } from './fetchers/reddit';
 import { fetchYoutube, pickYoutubeKey } from './fetchers/youtube';
+import { classifyAndStore } from './classifier';
 
 const ARTICLE_TTL_DAYS = 7;
 
@@ -46,7 +47,25 @@ export async function runCron(env: Env): Promise<void> {
     await env.DB.batch(stmts);
   }
 
-  // 4. Nettoyer les articles trop vieux
+  // 4. Classification Workers AI
+  // - YouTube : tous les articles (thème source = 'youtube', contenu varié)
+  // - Autres  : seulement les nouveaux articles sans classified_theme
+  const youtubeArticles = allArticles.filter((a) => a.theme === 'youtube');
+  const otherNew = allArticles.filter((a) => a.theme !== 'youtube');
+
+  // YouTube en priorité (classification complète)
+  if (youtubeArticles.length > 0) {
+    console.log(`[Cron] Classification YouTube : ${youtubeArticles.length} articles`);
+    await classifyAndStore(env, youtubeArticles);
+  }
+
+  // Autres articles : on classifie pour vérification croisée (utile pour détection hors-thème)
+  if (otherNew.length > 0) {
+    console.log(`[Cron] Classification autres sources : ${otherNew.length} articles`);
+    await classifyAndStore(env, otherNew);
+  }
+
+  // 5. Nettoyer les articles trop vieux
   const cutoff = Date.now() - ARTICLE_TTL_DAYS * 24 * 60 * 60 * 1000;
   const { meta } = await env.DB.prepare(
     'DELETE FROM articles WHERE fetched_at < ?'
