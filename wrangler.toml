@@ -1,0 +1,12 @@
+name = "techpulse-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "techpulse"
+database_id = "9dbf5d5f-1fef-488d-ab5c-5c24de9e3d95"
+
+[triggers]
+crons = ["0 */2 * * *"]  # toutes les 2h

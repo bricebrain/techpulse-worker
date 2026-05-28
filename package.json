@@ -1,0 +1,22 @@
+{
+  "name": "techpulse-worker",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute techpulse --file=schema.sql",
+    "db:init:local": "wrangler d1 execute techpulse --local --file=schema.sql",
+    "cron:trigger": "wrangler d1 execute techpulse --command='SELECT COUNT(*) FROM articles'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260528.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.95.0"
+  }
+}
