@@ -10,6 +10,10 @@ export interface Env {
   OPENAI_API_KEY?: string;
   GROQ_API_KEY_1?: string;
   GROQ_API_KEY_2?: string;
+  GROQ_TTS_KEY_1?: string;
+  GROQ_TTS_KEY_2?: string;
+  OPENROUTER_API_KEY?: string;
+  GEMINI_API_KEY?: string;
   DEEPSEEK_API_KEY?: string;
   // Clé pour sécuriser les routes d'écriture depuis l'app
   API_SECRET?: string;

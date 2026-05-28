@@ -2,6 +2,7 @@ import type { Env, Source } from './types';
 import { runCron } from './cron';
 import { json, err, isAuthorized } from './utils';
 import { adminPage } from './admin';
+import { handleProxy } from './proxy';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -24,6 +25,14 @@ export default {
           'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         },
       });
+    }
+
+    // ── /proxy/<target>/... — proxy IA transparent ───────────────────────
+    if (path.startsWith('/proxy/')) {
+      // Pas de secret requis en lecture (l'app est la seule à connaître l'URL)
+      // mais on peut l'activer si besoin : if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const pathAfterProxy = path.slice('/proxy/'.length); // "openai/v1/chat/completions"
+      return handleProxy(req, env, pathAfterProxy);
     }
 
     // ── GET /admin — page d'administration ───────────────────────────────
