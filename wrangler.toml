@@ -8,9 +8,9 @@ binding = "DB"
 database_name = "techpulse"
 database_id = "9dbf5d5f-1fef-488d-ab5c-5c24de9e3d95"
 
-# [[r2_buckets]]          ← décommenter après activation R2 dans le dashboard CF
-# binding = "PODCASTS"
-# bucket_name = "techpulse-podcasts"
+[[r2_buckets]]
+binding = "PODCASTS"
+bucket_name = "techpulse-podcasts"
 
 [ai]
 binding = "AI"
