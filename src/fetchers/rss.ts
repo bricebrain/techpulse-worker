@@ -1,9 +1,6 @@
 import type { Article, Source } from '../types';
 import { makeHash } from '../utils';
 
-// Durée de vie maximale des articles : 7 jours
-const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
 export async function fetchRss(source: Source): Promise<Article[]> {
   const res = await fetch(source.value, {
     headers: { 'User-Agent': 'TechPulse/1.0 (RSS reader)' },
@@ -13,11 +10,8 @@ export async function fetchRss(source: Source): Promise<Article[]> {
   if (!res?.ok) return [];
 
   const xml = await res.text();
-  const articles = parseXml(xml, source);
-  const cutoff = Date.now() - MAX_AGE_MS;
-  return articles
-    .filter((a) => !a.published_at || a.published_at >= cutoff)
-    .slice(0, source.limit_count);
+  // Pas de filtre par âge ici — le nettoyage TTL est géré par le cron (DELETE fetched_at < 7j)
+  return parseXml(xml, source).slice(0, source.limit_count);
 }
 
 function parseXml(xml: string, source: Source): Article[] {
