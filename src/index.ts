@@ -1,5 +1,5 @@
 import type { Env, Source } from './types';
-import { runCron } from './cron';
+import { runCron, fetchAndStoreSource } from './cron';
 import { json, err, isAuthorized } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
@@ -114,6 +114,15 @@ export default {
         `INSERT INTO sources (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`
       ).bind(id, body.name, body.theme, body.type, body.value, limit, now, now).run();
+
+      // Fetch immédiat de la nouvelle source (sans attendre le cron)
+      const newSource: Source = {
+        id, name: body.name, theme: body.theme,
+        type: body.type as Source['type'], value: body.value,
+        limit_count: limit, is_active: 1, is_default: 0,
+        created_at: now, updated_at: now,
+      };
+      ctx.waitUntil(fetchAndStoreSource(newSource, env));
 
       return json({ id, message: 'Source créée' }, 201);
     }

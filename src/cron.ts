@@ -75,6 +75,31 @@ export async function runCron(env: Env): Promise<void> {
   console.log('[Cron] Terminé ✓');
 }
 
+/**
+ * Fetche une seule source, upsert ses articles et les classifie.
+ * Utilisé par POST /sources pour éviter d'attendre le prochain cron.
+ */
+export async function fetchAndStoreSource(source: Source, env: Env): Promise<void> {
+  try {
+    const articles = await fetchSource(source, env);
+    if (!articles.length) return;
+
+    const stmts = articles.map((a) =>
+      env.DB.prepare(
+        `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at, content = excluded.content`
+      ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at)
+    );
+    await env.DB.batch(stmts);
+    await classifyAndStore(env, articles);
+
+    console.log(`[Source] ${source.name} : ${articles.length} articles fetchés et classifiés`);
+  } catch (e) {
+    console.warn(`[Source] Erreur fetch ${source.name}:`, e);
+  }
+}
+
 async function fetchSource(source: Source, env: Env): Promise<Article[]> {
   switch (source.type) {
     case 'rss':
