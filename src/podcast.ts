@@ -129,15 +129,150 @@ function parseScript(raw: string, fallbackTitle: string): PodcastScript | null {
   }
 }
 
+// ─── Helper LLM : DeepSeek → Groq → Gemini → OpenRouter ─────────────────────
+// DeepSeek en 1er : non partagé avec le proxy app → quota dédié podcast.
+
+interface LLMMessage { role: 'system' | 'user'; content: string }
+
+async function callLLM(
+  env: Env,
+  messages: LLMMessage[],
+  maxTokens: number,
+  temperature: number,
+  label: string,
+): Promise<string | null> {
+  // 1. DeepSeek-V3 — quota isolé (pas utilisé par le proxy app)
+  if (env.DEEPSEEK_API_KEY) {
+    try {
+      const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          max_tokens: maxTokens,
+          temperature,
+          messages,
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM DeepSeek ✓`); return text; }
+      } else if (res.status === 429) {
+        console.warn(`[${label}] DeepSeek 429 → fallback Groq`);
+      } else {
+        console.warn(`[${label}] DeepSeek ${res.status}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] DeepSeek exception:`, e);
+    }
+  }
+
+  // 2. Groq (llama-3.3-70b-versatile)
+  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+  if (groqKey) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: maxTokens,
+          temperature,
+          messages,
+        }),
+        signal: AbortSignal.timeout(40_000),
+      });
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM Groq ✓`); return text; }
+      } else if (res.status === 429) {
+        console.warn(`[${label}] Groq 429 (rate-limit) → fallback Gemini`);
+      } else {
+        console.warn(`[${label}] Groq ${res.status}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] Groq exception:`, e);
+    }
+  }
+
+  // 2. Gemini Flash (API OpenAI-compatible de Google)
+  if (env.GEMINI_API_KEY) {
+    try {
+      const res = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${env.GEMINI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-2.0-flash',
+            max_tokens: maxTokens,
+            temperature,
+            messages,
+          }),
+          signal: AbortSignal.timeout(60_000),
+        },
+      );
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM Gemini Flash ✓`); return text; }
+      } else if (res.status === 429) {
+        console.warn(`[${label}] Gemini 429 → fallback OpenRouter`);
+      } else {
+        const errTxt = await res.text().catch(() => '');
+        console.warn(`[${label}] Gemini ${res.status}: ${errTxt.slice(0, 200)}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] Gemini exception:`, e);
+    }
+  }
+
+  // 4. OpenRouter (modèle gratuit llama-3.3-70b)
+  if (env.OPENROUTER_API_KEY) {
+    try {
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://techpulse-worker.bricebrain.workers.dev',
+        },
+        body: JSON.stringify({
+          model: 'meta-llama/llama-3.3-70b-instruct:free',
+          max_tokens: maxTokens,
+          temperature,
+          messages,
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM OpenRouter ✓`); return text; }
+      } else {
+        const errTxt = await res.text().catch(() => '');
+        console.warn(`[${label}] OpenRouter ${res.status}: ${errTxt.slice(0, 200)}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] OpenRouter exception:`, e);
+    }
+  }
+
+  console.warn(`[${label}] Tous les LLMs ont échoué (Groq+Gemini+DeepSeek+OpenRouter)`);
+  return null;
+}
+
 // ─── Script quotidien vulgarisé (3 articles, ~10-12 min) ─────────────────────
 
 async function generateDailyScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
-  if (!groqKey) {
-    console.warn('[Podcast] Aucune clé Groq');
+  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.GEMINI_API_KEY) {
+    console.warn('[Podcast/daily] Aucun LLM disponible');
     return null;
   }
 
@@ -176,40 +311,22 @@ async function generateDailyScript(
     `- impact (analyst) : chiffres, acteurs, conséquences réelles\n` +
     `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
 
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${groqKey}`,
-        'Content-Type': 'application/json',
+  const raw = await callLLM(
+    env,
+    [
+      {
+        role: 'system',
+        content:
+          'Tu es un producteur de podcast tech francophone spécialisé en vulgarisation. Tu rends la tech accessible à tous. Tu réponds UNIQUEMENT en JSON valide.',
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 3500,
-        temperature: 0.75,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Tu es un producteur de podcast tech francophone spécialisé en vulgarisation. Tu rends la tech accessible à tous. Tu réponds UNIQUEMENT en JSON valide.',
-          },
-          { role: 'user', content: prompt },
-        ],
-      }),
-      signal: AbortSignal.timeout(35_000),
-    });
-
-    if (!res.ok) {
-      console.warn(`[Podcast/daily] Groq ${res.status}`);
-      return null;
-    }
-    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
-    const raw = data?.choices?.[0]?.message?.content ?? '';
-    return parseScript(raw, `TechBrief — ${todayFr()}`);
-  } catch (e) {
-    console.warn('[Podcast/daily] Groq exception:', e);
-    return null;
-  }
+      { role: 'user', content: prompt },
+    ],
+    3500,
+    0.75,
+    'Podcast/daily',
+  );
+  if (!raw) return null;
+  return parseScript(raw, `TechBrief — ${todayFr()}`);
 }
 
 // ─── Script Deep Dive hebdomadaire (1 sujet, ~18-20 min) ─────────────────────
@@ -218,8 +335,10 @@ async function generateDeepDiveScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
-  if (!groqKey) return null;
+  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.GEMINI_API_KEY) {
+    console.warn('[Podcast/deep_dive] Aucun LLM disponible');
+    return null;
+  }
 
   // Sujet principal : article avec le plus de contenu disponible
   const article = [...articles].sort((a, b) =>
@@ -250,40 +369,22 @@ async function generateDeepDiveScript(
     `- Respecter les word counts pour atteindre 18-20 minutes de contenu total\n` +
     `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
 
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${groqKey}`,
-        'Content-Type': 'application/json',
+  const raw = await callLLM(
+    env,
+    [
+      {
+        role: 'system',
+        content:
+          'Tu es un journaliste tech expert, pédagogue et passionné. Tu crées des contenus audio longs, approfondis et accessibles. Tu réponds UNIQUEMENT en JSON valide.',
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 5000,
-        temperature: 0.8,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Tu es un journaliste tech expert, pédagogue et passionné. Tu crées des contenus audio longs, approfondis et accessibles. Tu réponds UNIQUEMENT en JSON valide.',
-          },
-          { role: 'user', content: prompt },
-        ],
-      }),
-      signal: AbortSignal.timeout(45_000),
-    });
-
-    if (!res.ok) {
-      console.warn(`[Podcast/deep_dive] Groq ${res.status}`);
-      return null;
-    }
-    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
-    const raw = data?.choices?.[0]?.message?.content ?? '';
-    return parseScript(raw, `🔬 Deep Dive — ${todayFr()}`);
-  } catch (e) {
-    console.warn('[Podcast/deep_dive] Groq exception:', e);
-    return null;
-  }
+      { role: 'user', content: prompt },
+    ],
+    5000,
+    0.8,
+    'Podcast/deep_dive',
+  );
+  if (!raw) return null;
+  return parseScript(raw, `🔬 Deep Dive — ${todayFr()}`);
 }
 
 // ─── TTS segment par segment ──────────────────────────────────────────────────
@@ -468,10 +569,14 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
     console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
     return;
   }
-  if (!env.OPENAI_API_KEY) {
-    console.warn('[Podcast] OPENAI_API_KEY manquant — TTS impossible');
+
+  const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
+  const hasOpenAI  = !!env.OPENAI_API_KEY;
+  if (!hasFastApi && !hasOpenAI) {
+    console.warn('[Podcast] Aucun provider TTS disponible (ni FastAPI/HF ni OpenAI) — abandon');
     return;
   }
+  console.log(`[Podcast] TTS providers disponibles : ${[hasFastApi && 'Parler-HF', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
 
   const articles = await fetchTopArticles(env, 20, 24);
   if (articles.length < 3) {
@@ -502,8 +607,11 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
     console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
     return;
   }
-  if (!env.OPENAI_API_KEY) {
-    console.warn('[Podcast] OPENAI_API_KEY manquant — TTS impossible');
+
+  const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
+  const hasOpenAI  = !!env.OPENAI_API_KEY;
+  if (!hasFastApi && !hasOpenAI) {
+    console.warn('[Podcast] Aucun provider TTS disponible — abandon');
     return;
   }
 

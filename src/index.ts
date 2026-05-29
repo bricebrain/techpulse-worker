@@ -10,15 +10,24 @@ import { handleProxy } from './proxy';
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Articles toutes les 2h, podcast à 6h UTC (les deux tournent si cron = 6h)
+    // ⚠️ Budget subrequests : chaque invocation cron a son propre budget.
+    // Les crons 0 6 * * * et 0 6 * * 5 coïncident avec 0 */2 * * *,
+    // donc runCron tourne déjà dans une invocation parallèle.
+    // On ne le relance PAS dans les invocations podcast/deep-dive
+    // pour ne pas épuiser le budget avant les appels LLM/TTS.
+    const isPodcastCron = event.cron === '0 6 * * *' || event.cron === '0 6 * * 5';
+
     ctx.waitUntil(
       (async () => {
-        await runCron(env);
+        if (!isPodcastCron) {
+          // 0 */2 * * * (articles) et 0 7 * * * (suggestions) → fetch articles d'abord
+          await runCron(env);
+        }
         if (event.cron === '0 6 * * *') {
           await generateDailyPodcast(env);
         }
         if (event.cron === '0 6 * * 5') {
-          // Vendredi : Deep Dive hebdomadaire (le TechBrief quotidien tourne aussi ce jour-là)
+          // Vendredi : Deep Dive (TechBrief est généré par 0 6 * * * le même jour)
           await generateDeepDivePodcast(env);
         }
         if (event.cron === '0 7 * * *') {
@@ -338,6 +347,24 @@ export default {
     // ── POST /podcasts/generate — TechBrief quotidien manuellement ────────
     if (method === 'POST' && path === '/podcasts/generate') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      // ?sync=1 : attend la fin et retourne le résultat (debug uniquement)
+      if (url.searchParams.get('sync') === '1') {
+        const t0 = Date.now();
+        console.log(`[SyncGen] Démarrage à ${t0}`);
+        try {
+          console.log(`[SyncGen] PODCASTS=${!!env.PODCASTS} OPENAI=${!!env.OPENAI_API_KEY} GROQ=${!!(env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2)}`);
+          await generateDailyPodcast(env);
+          const elapsed = Date.now() - t0;
+          console.log(`[SyncGen] generateDailyPodcast terminé en ${elapsed}ms`);
+          const result = await env.DB.prepare(
+            `SELECT id, title FROM podcast_feed ORDER BY generated_at DESC LIMIT 1`
+          ).first<{ id: string; title: string }>();
+          return json({ done: true, elapsed_ms: elapsed, latest: result ?? null });
+        } catch (e) {
+          console.error(`[SyncGen] Exception: ${String(e)}`);
+          return json({ done: false, error: String(e), elapsed_ms: Date.now() - t0 }, 500);
+        }
+      }
       ctx.waitUntil(generateDailyPodcast(env));
       return json({ message: 'Génération TechBrief lancée en arrière-plan' });
     }
@@ -444,6 +471,236 @@ export default {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       ctx.waitUntil(generateSuggestions(env));
       return json({ message: 'Analyse de suggestions lancée en arrière-plan' });
+    }
+
+    // ── POST /podcasts/debug2 — trace étape par étape de la génération ──────
+    if (method === 'POST' && path === '/podcasts/debug2') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const steps: Record<string, unknown> = { ts: Date.now() };
+
+      // Étape 1 : articles récents
+      const cutoff = Date.now() - 24 * 3600 * 1000;
+      const { results: arts } = await env.DB.prepare(
+        `SELECT title, source_name, content, published_at FROM articles WHERE published_at > ? ORDER BY published_at DESC LIMIT 20`
+      ).bind(cutoff).all<{ title: string; source_name: string; content: string | null; published_at: number | null }>();
+      steps.articles_found = arts.length;
+      if (arts.length < 3) return json({ ...steps, blocker: 'not_enough_articles' });
+      steps.article_sample = arts[0]?.title;
+
+      // Étape 2 : appel Groq (prompt réduit pour rapidité)
+      const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+      if (!groqKey) return json({ ...steps, blocker: 'no_groq_key' });
+
+      const articleList = arts.slice(0, 3)
+        .map((a, i) => `Article ${i + 1}: "${a.title}" (${a.source_name})`)
+        .join('\n');
+
+      const groqStart = Date.now();
+      let groqBody: Response | null = null;
+      try {
+        groqBody = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            max_tokens: 80,
+            messages: [{ role: 'user', content: `Ces articles tech sont-ils intéressants ? Réponds "oui" ou "non".\n${articleList}` }],
+          }),
+          signal: AbortSignal.timeout(20_000),
+        });
+        steps.groq_status = groqBody.status;
+        steps.groq_ms = Date.now() - groqStart;
+        if (!groqBody.ok) {
+          steps.groq_error = await groqBody.text().catch(() => '');
+          return json({ ...steps, blocker: 'groq_failed' });
+        }
+        const gd = await groqBody.json<{ choices?: { message?: { content?: string } }[]; usage?: unknown }>();
+        steps.groq_reply = gd.choices?.[0]?.message?.content?.slice(0, 50);
+        steps.groq_usage = gd.usage;
+      } catch (e) {
+        steps.groq_error = String(e);
+        steps.groq_ms = Date.now() - groqStart;
+        return json({ ...steps, blocker: 'groq_exception' });
+      }
+
+      // Étape 3 : TTS OpenAI sur un texte court
+      if (env.OPENAI_API_KEY) {
+        const ttsStart = Date.now();
+        try {
+          const ttsRes = await fetch('https://api.openai.com/v1/audio/speech', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'gpt-4o-mini-tts', voice: 'alloy',
+              input: 'Bienvenue dans TechBrief, votre podcast tech du jour.',
+              response_format: 'aac',
+            }),
+            signal: AbortSignal.timeout(20_000),
+          });
+          steps.tts_status = ttsRes.status;
+          steps.tts_ms = Date.now() - ttsStart;
+          if (ttsRes.ok) {
+            const buf = await ttsRes.arrayBuffer();
+            steps.tts_bytes = buf.byteLength;
+          } else {
+            steps.tts_error = await ttsRes.text().catch(() => '');
+          }
+        } catch (e) {
+          steps.tts_error = String(e);
+          steps.tts_ms = Date.now() - ttsStart;
+        }
+      }
+
+      // Étape 4 : test R2 write/read
+      if (env.PODCASTS) {
+        try {
+          await env.PODCASTS.put('debug/test.txt', 'ok', { httpMetadata: { contentType: 'text/plain' } });
+          const obj = await env.PODCASTS.get('debug/test.txt');
+          steps.r2_write_read = obj ? 'ok' : 'write_ok_read_fail';
+          await env.PODCASTS.delete('debug/test.txt');
+        } catch (e) {
+          steps.r2_error = String(e);
+        }
+      }
+
+      steps.total_ms = Date.now() - (steps.ts as number);
+      return json(steps);
+    }
+
+    // ── POST /podcasts/debug — diagnostic complet de la chaîne TTS ────────
+    if (method === 'POST' && path === '/podcasts/debug') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const report: Record<string, unknown> = {};
+
+      // 1. Articles disponibles
+      const arts = await env.DB.prepare(
+        `SELECT COUNT(*) as cnt FROM articles WHERE fetched_at > ?`
+      ).bind(Date.now() - 12 * 3600 * 1000).first<{ cnt: number }>();
+      report.articles_last_12h = arts?.cnt ?? 0;
+
+      // 2. Podcasts en base
+      const pods = await env.DB.prepare(
+        `SELECT COUNT(*) as cnt FROM podcast_feed`
+      ).first<{ cnt: number }>();
+      report.podcasts_total = pods?.cnt ?? 0;
+
+      // 3. Variables d'env disponibles
+      report.env = {
+        GROQ_API_KEY_1: !!env.GROQ_API_KEY_1,
+        GROQ_API_KEY_2: !!env.GROQ_API_KEY_2,
+        OPENAI_API_KEY: !!env.OPENAI_API_KEY,
+        REDDIT_PROXY_URL: env.REDDIT_PROXY_URL || null,
+        REDDIT_PROXY_SECRET: !!env.REDDIT_PROXY_SECRET,
+        HF_TOKEN: !!(env as Record<string, unknown>).HF_TOKEN,
+        PODCASTS_R2: !!env.PODCASTS,
+      };
+
+      // 4. Test FastAPI /health ou /api/v1/tts/podcast-segment
+      if (env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET) {
+        const baseUrl = env.REDDIT_PROXY_URL.replace(/\/$/, '');
+        try {
+          // Test ping via docs ou root
+          const pingRes = await fetch(`${baseUrl}/docs`, {
+            signal: AbortSignal.timeout(10_000),
+          });
+          report.fastapi_docs_status = pingRes.status;
+        } catch (e) {
+          report.fastapi_docs_error = String(e);
+        }
+
+        // Test TTS court (5 mots)
+        try {
+          const ttsRes = await fetch(`${baseUrl}/api/v1/tts/podcast-segment`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              text: 'Bonjour, test audio.',
+              voice: 'host',
+              provider: 'parler_hf',
+              response_format: 'wav',
+            }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          report.fastapi_tts_status = ttsRes.status;
+          if (ttsRes.ok) {
+            const buf = await ttsRes.arrayBuffer();
+            report.fastapi_tts_bytes = buf.byteLength;
+          } else {
+            report.fastapi_tts_error = await ttsRes.text().catch(() => '');
+          }
+        } catch (e) {
+          report.fastapi_tts_error = String(e);
+        }
+      } else {
+        report.fastapi_tts_status = 'skipped — REDDIT_PROXY_URL ou SECRET manquant';
+      }
+
+      // 5. Test OpenAI TTS si disponible
+      if (env.OPENAI_API_KEY) {
+        try {
+          const oaiRes = await fetch('https://api.openai.com/v1/audio/speech', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'gpt-4o-mini-tts',
+              voice: 'alloy',
+              input: 'Test.',
+              response_format: 'aac',
+            }),
+            signal: AbortSignal.timeout(20_000),
+          });
+          report.openai_tts_status = oaiRes.status;
+          if (oaiRes.ok) {
+            const buf = await oaiRes.arrayBuffer();
+            report.openai_tts_bytes = buf.byteLength;
+          } else {
+            report.openai_tts_error = await oaiRes.text().catch(() => '');
+          }
+        } catch (e) {
+          report.openai_tts_error = String(e);
+        }
+      } else {
+        report.openai_tts_status = 'skipped — OPENAI_API_KEY absent';
+      }
+
+      // 6. Test Groq LLM
+      const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+      if (groqKey) {
+        try {
+          const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${groqKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'llama-3.3-70b-versatile',
+              messages: [{ role: 'user', content: 'Réponds juste "ok".' }],
+              max_tokens: 5,
+            }),
+            signal: AbortSignal.timeout(15_000),
+          });
+          report.groq_status = groqRes.status;
+          if (!groqRes.ok) {
+            const errText = await groqRes.text().catch(() => '');
+            report.groq_error = errText;
+          }
+        } catch (e) {
+          report.groq_error = String(e);
+        }
+      } else {
+        report.groq_status = 'skipped — GROQ_API_KEY_1 et GROQ_API_KEY_2 absents';
+      }
+
+      return json(report);
     }
 
     return err('Route inconnue', 404);
