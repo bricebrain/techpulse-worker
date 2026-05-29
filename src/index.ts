@@ -1,6 +1,6 @@
 import type { Env, Source } from './types';
 import { runCron, fetchAndStoreSource } from './cron';
-import { json, err, isAuthorized } from './utils';
+import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
 
@@ -218,6 +218,39 @@ export default {
       const id = path.split('/')[2];
       await env.DB.prepare('DELETE FROM sources WHERE id = ?').bind(id).run();
       return json({ message: 'Source supprimée' });
+    }
+
+    // ── POST /articles/ingest — ingestion d'articles depuis l'app mobile ────
+    // Utilisé pour pousser les articles Reddit (IP téléphone non bloquée par Reddit)
+    if (method === 'POST' && path === '/articles/ingest') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      interface IngestArticle {
+        hash?: string;
+        theme: string;
+        title: string;
+        source_name?: string;
+        url?: string | null;
+        content?: string | null;
+        published_at?: number | null;
+      }
+
+      const body = await req.json<{ articles?: IngestArticle[] }>().catch(() => null);
+      const list = (body?.articles ?? []).filter((a) => a.title && a.theme);
+      if (!list.length) return json({ ingested: 0 });
+
+      const now = Date.now();
+      const stmts = list.map((a) => {
+        const hash = a.hash || makeHash(`${a.source_name ?? 'unknown'}|${a.url || a.title}`);
+        return env.DB.prepare(
+          `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at`
+        ).bind(hash, a.theme, a.title, a.source_name ?? null, a.url ?? null, a.content ?? null, a.published_at ?? null, now);
+      });
+
+      await env.DB.batch(stmts);
+      return json({ ingested: stmts.length });
     }
 
     // ── POST /cron/trigger — déclencher le cron manuellement ─────────────

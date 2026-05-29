@@ -108,7 +108,7 @@ async function fetchSource(source: Source, env: Env): Promise<Article[]> {
       return fetchRss(source);
 
     case 'reddit_rss':
-      return fetchReddit(source);
+      return fetchReddit(source, env);
 
     case 'youtube_channel':
       return fetchYoutube(
