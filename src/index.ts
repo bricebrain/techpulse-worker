@@ -17,7 +17,7 @@ export default {
         if (event.cron === '0 6 * * *') {
           await generateDailyPodcast(env);
         }
-        if (event.cron === '0 8 * * 1') {
+        if (event.cron === '0 7 * * *') {
           await generateSuggestions(env);
         }
       })(),
