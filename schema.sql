@@ -32,12 +32,25 @@ CREATE TABLE IF NOT EXISTS config (
   updated_at TEXT NOT NULL
 );
 
+-- Podcasts auto-générés par le cron quotidien
+CREATE TABLE IF NOT EXISTS podcast_feed (
+  id             TEXT PRIMARY KEY,
+  title          TEXT NOT NULL,
+  theme          TEXT NOT NULL DEFAULT 'general',
+  generated_at   INTEGER NOT NULL,
+  segment_count  INTEGER NOT NULL DEFAULT 0,
+  segments_json  TEXT NOT NULL DEFAULT '[]',  -- [{id,type,speaker,text}] sans audioUri
+  is_ready       INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT NOT NULL
+);
+
 -- Index pour les requêtes fréquentes
 CREATE INDEX IF NOT EXISTS idx_articles_theme       ON articles(theme);
 CREATE INDEX IF NOT EXISTS idx_articles_fetched_at  ON articles(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_articles_classified  ON articles(classified_theme);
 CREATE INDEX IF NOT EXISTS idx_sources_theme        ON sources(theme);
 CREATE INDEX IF NOT EXISTS idx_sources_active       ON sources(is_active);
+CREATE INDEX IF NOT EXISTS idx_podcast_generated    ON podcast_feed(generated_at);
 
 -- Sources par défaut
 INSERT OR IGNORE INTO sources VALUES

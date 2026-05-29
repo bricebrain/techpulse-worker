@@ -21,6 +21,8 @@ export interface Env {
   // Proxy FastAPI (Render) pour contourner le blocage IP Reddit
   REDDIT_PROXY_URL?: string;    // ex: https://techpulse-api.onrender.com
   REDDIT_PROXY_SECRET?: string; // partagé avec la variable reddit_proxy_secret de FastAPI
+  // R2 bucket pour les podcasts auto-générés (optionnel — activer R2 dans le dashboard CF d'abord)
+  PODCASTS?: R2Bucket;
 }
 
 export interface Source {

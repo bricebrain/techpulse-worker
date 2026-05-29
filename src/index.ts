@@ -1,13 +1,22 @@
 import type { Env, Source } from './types';
 import { runCron, fetchAndStoreSource } from './cron';
+import { generateDailyPodcast } from './podcast';
 import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runCron(env));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Articles toutes les 2h, podcast à 6h UTC (les deux tournent si cron = 6h)
+    ctx.waitUntil(
+      (async () => {
+        await runCron(env);
+        if (event.cron === '0 6 * * *') {
+          await generateDailyPodcast(env);
+        }
+      })(),
+    );
   },
 
   // ─── API HTTP ─────────────────────────────────────────────────────────────
@@ -258,6 +267,64 @@ export default {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       ctx.waitUntil(runCron(env));
       return json({ message: 'Cron lancé en arrière-plan' });
+    }
+
+    // ── GET /podcasts — liste des podcasts auto-générés ───────────────────
+    if (method === 'GET' && path === '/podcasts') {
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? '7'), 20);
+      const { results } = await env.DB.prepare(
+        `SELECT id, title, theme, generated_at, segment_count, segments_json, created_at
+         FROM podcast_feed
+         WHERE is_ready = 1
+         ORDER BY generated_at DESC
+         LIMIT ?`,
+      ).bind(limit).all<{
+        id: string; title: string; theme: string;
+        generated_at: number; segment_count: number;
+        segments_json: string; created_at: string;
+      }>();
+
+      const podcasts = results.map((p) => ({
+        id: p.id,
+        title: p.title,
+        theme: p.theme,
+        generated_at: p.generated_at,
+        segment_count: p.segment_count,
+        segments: (() => { try { return JSON.parse(p.segments_json); } catch { return []; } })(),
+        created_at: p.created_at,
+      }));
+
+      return json({ podcasts, count: podcasts.length });
+    }
+
+    // ── GET /podcasts/:id/segments/:index — stream MP3 depuis R2 ─────────
+    if (method === 'GET' && path.startsWith('/podcasts/')) {
+      const parts = path.split('/'); // ['', 'podcasts', id, 'segments', index]
+      if (parts.length === 5 && parts[3] === 'segments') {
+        const podId = parts[2];
+        const segIndex = parseInt(parts[4] ?? '', 10);
+
+        if (!podId || isNaN(segIndex)) return err('Paramètres invalides');
+        if (!env.PODCASTS) return err('R2 non configuré', 503);
+
+        const obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.mp3`);
+        if (!obj) return err('Segment audio introuvable', 404);
+
+        return new Response(obj.body, {
+          headers: {
+            'Content-Type': 'audio/mpeg',
+            'Cache-Control': 'public, max-age=86400',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+    }
+
+    // ── POST /podcasts/generate — déclencher la génération manuellement ───
+    if (method === 'POST' && path === '/podcasts/generate') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      ctx.waitUntil(generateDailyPodcast(env));
+      return json({ message: 'Génération podcast lancée en arrière-plan' });
     }
 
     return err('Route inconnue', 404);

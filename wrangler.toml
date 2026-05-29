@@ -8,8 +8,12 @@ binding = "DB"
 database_name = "techpulse"
 database_id = "9dbf5d5f-1fef-488d-ab5c-5c24de9e3d95"
 
+# [[r2_buckets]]          ← décommenter après activation R2 dans le dashboard CF
+# binding = "PODCASTS"
+# bucket_name = "techpulse-podcasts"
+
 [ai]
 binding = "AI"
 
 [triggers]
-crons = ["0 */2 * * *"]  # toutes les 2h
+crons = ["0 */2 * * *", "0 6 * * *"]  # articles toutes les 2h + podcast quotidien à 6h UTC
