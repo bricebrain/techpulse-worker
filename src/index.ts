@@ -61,6 +61,8 @@ export default {
       if (!theme) return err('Paramètre theme requis');
 
       // Si ?classified=ai → articles YouTube classifiés comme IA
+      // Pour les thèmes non-youtube : on inclut automatiquement les vidéos
+      // YouTube dont le classified_theme correspond au thème demandé.
       const { results } = classified
         ? await env.DB.prepare(
             `SELECT * FROM articles
@@ -68,12 +70,19 @@ export default {
              ORDER BY published_at DESC, fetched_at DESC
              LIMIT ?`
           ).bind(theme, classified, limit).all()
-        : await env.DB.prepare(
+        : theme === 'youtube'
+        ? await env.DB.prepare(
             `SELECT * FROM articles
-             WHERE theme = ?
+             WHERE theme = 'youtube'
              ORDER BY published_at DESC, fetched_at DESC
              LIMIT ?`
-          ).bind(theme, limit).all();
+          ).bind(limit).all()
+        : await env.DB.prepare(
+            `SELECT * FROM articles
+             WHERE theme = ? OR (theme = 'youtube' AND classified_theme = ?)
+             ORDER BY published_at DESC, fetched_at DESC
+             LIMIT ?`
+          ).bind(theme, theme, limit).all();
 
       return json({ articles: results, theme, classified: classified ?? null, count: results.length });
     }
@@ -135,22 +144,50 @@ export default {
       const list = body?.sources ?? [];
       if (!list.length) return json({ synced: 0 });
 
+      const validList = list.filter((s) => s.id && s.name && s.theme && s.type && s.value);
+      if (!validList.length) return json({ synced: 0 });
+
+      // Détecter les sources déjà connues pour ne fetcher que les nouvelles
+      const ids = validList.map((s) => s.id as string);
+      const placeholders = ids.map(() => '?').join(',');
+      const { results: existingRows } = await env.DB.prepare(
+        `SELECT id FROM sources WHERE id IN (${placeholders})`
+      ).bind(...ids).all<{ id: string }>();
+      const knownIds = new Set(existingRows.map((r) => r.id));
+
       const now = new Date().toISOString();
-      const stmts = list
-        .filter((s) => s.id && s.name && s.theme && s.type && s.value)
-        .map((s) =>
-          env.DB.prepare(
-            `INSERT INTO sources (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-               name        = excluded.name,
-               limit_count = excluded.limit_count,
-               updated_at  = excluded.updated_at`
-          ).bind(s.id, s.name, s.theme, s.type, s.value, s.limit_count ?? 5, now, now)
-        );
+      const stmts = validList.map((s) =>
+        env.DB.prepare(
+          `INSERT INTO sources (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             name        = excluded.name,
+             limit_count = excluded.limit_count,
+             updated_at  = excluded.updated_at`
+        ).bind(s.id, s.name, s.theme, s.type, s.value, s.limit_count ?? 5, now, now)
+      );
 
       await env.DB.batch(stmts);
-      return json({ synced: stmts.length });
+
+      // Fetch immédiat uniquement pour les sources vraiment nouvelles
+      const newSources: Source[] = validList
+        .filter((s) => !knownIds.has(s.id as string))
+        .map((s) => ({
+          id: s.id as string,
+          name: s.name as string,
+          theme: s.theme as string,
+          type: s.type as Source['type'],
+          value: s.value as string,
+          limit_count: s.limit_count ?? 5,
+          is_active: 1, is_default: 0,
+          created_at: now, updated_at: now,
+        }));
+
+      if (newSources.length > 0) {
+        ctx.waitUntil(Promise.all(newSources.map((src) => fetchAndStoreSource(src, env))));
+      }
+
+      return json({ synced: stmts.length, fetching: newSources.length });
     }
 
     // ── PUT /sources/:id ──────────────────────────────────────────────────

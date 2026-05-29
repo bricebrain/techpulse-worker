@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS config (
 -- Index pour les requêtes fréquentes
 CREATE INDEX IF NOT EXISTS idx_articles_theme       ON articles(theme);
 CREATE INDEX IF NOT EXISTS idx_articles_fetched_at  ON articles(fetched_at);
+CREATE INDEX IF NOT EXISTS idx_articles_classified  ON articles(classified_theme);
 CREATE INDEX IF NOT EXISTS idx_sources_theme        ON sources(theme);
 CREATE INDEX IF NOT EXISTS idx_sources_active       ON sources(is_active);
 
