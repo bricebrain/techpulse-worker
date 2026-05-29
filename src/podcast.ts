@@ -53,12 +53,12 @@ const VOICES: Record<'host' | 'analyst', { voice: string; instructions: string }
   host: {
     voice: 'alloy',
     instructions:
-      'Tu es un présentateur tech passionné et pédagogue. Parle avec chaleur et enthousiasme, de façon claire et accessible. Ton dynamique, accrocheur, qui donne envie d\'écouter la suite.',
+      'Voix sèche, enregistrement studio sans réverbération ni écho. Débit naturel et fluide, ton chaleureux et direct. Pas d\'effets acoustiques.',
   },
   analyst: {
     voice: 'onyx',
     instructions:
-      'Tu es un analyste tech expert. Articule chaque point avec précision et profondeur. Ton sérieux et informatif, mais toujours accessible — tu expliques sans jargon inutile.',
+      'Voix sèche, enregistrement studio sans réverbération ni écho. Débit posé et précis, ton informatif et clair. Pas d\'effets acoustiques.',
   },
 };
 
@@ -287,8 +287,44 @@ async function generateDeepDiveScript(
 }
 
 // ─── TTS segment par segment ──────────────────────────────────────────────────
+// Priorité : FastAPI → Parler-TTS HF (gratuit)
+// Fallback  : OpenAI gpt-4o-mini-tts (~$4/mois) si FastAPI indisponible
 
-async function synthesizeSegment(
+async function synthesizeViaFastApi(
+  segment: PodcastSegment,
+  env: Env,
+): Promise<ArrayBuffer | null> {
+  const baseUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
+  if (!baseUrl || !env.REDDIT_PROXY_SECRET) return null;
+
+  try {
+    const res = await fetch(`${baseUrl}/api/v1/tts/podcast-segment`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: segment.text,
+        voice: segment.speaker, // "host" | "analyst" → mappé dans parler_provider.py
+        provider: 'parler_hf',
+        response_format: 'wav',
+      }),
+      signal: AbortSignal.timeout(90_000), // Parler-TTS peut prendre 20-60s (cold start HF)
+    });
+
+    if (!res.ok) {
+      console.warn(`[Podcast] FastAPI TTS ${segment.id} → ${res.status}`);
+      return null;
+    }
+    return res.arrayBuffer();
+  } catch (e) {
+    console.warn(`[Podcast] FastAPI TTS exception ${segment.id}:`, e);
+    return null;
+  }
+}
+
+async function synthesizeViaOpenAI(
   segment: PodcastSegment,
   env: Env,
 ): Promise<ArrayBuffer | null> {
@@ -307,20 +343,39 @@ async function synthesizeSegment(
         voice: config.voice,
         input: segment.text,
         instructions: config.instructions,
-        response_format: 'mp3',
+        response_format: 'aac',
       }),
       signal: AbortSignal.timeout(30_000),
     });
 
     if (!res.ok) {
-      console.warn(`[Podcast] TTS ${segment.id} → ${res.status}`);
+      console.warn(`[Podcast] OpenAI TTS ${segment.id} → ${res.status}`);
       return null;
     }
     return res.arrayBuffer();
   } catch (e) {
-    console.warn(`[Podcast] TTS exception ${segment.id}:`, e);
+    console.warn(`[Podcast] OpenAI TTS exception ${segment.id}:`, e);
     return null;
   }
+}
+
+async function synthesizeSegment(
+  segment: PodcastSegment,
+  env: Env,
+): Promise<{ buffer: ArrayBuffer; ext: 'wav' | 'aac' } | null> {
+  // Essayer Parler-TTS via FastAPI (gratuit)
+  const hfAudio = await synthesizeViaFastApi(segment, env);
+  if (hfAudio) {
+    console.log(`[Podcast] Segment ${segment.id} → Parler-TTS HF ✓`);
+    return { buffer: hfAudio, ext: 'wav' };
+  }
+
+  // Fallback OpenAI
+  console.warn(`[Podcast] Fallback OpenAI TTS pour ${segment.id}`);
+  const oaiAudio = await synthesizeViaOpenAI(segment, env);
+  if (oaiAudio) return { buffer: oaiAudio, ext: 'aac' };
+
+  return null;
 }
 
 // ─── Upload R2 + sauvegarde D1 ────────────────────────────────────────────────
@@ -336,15 +391,17 @@ async function uploadAndSave(
 
   for (let i = 0; i < script.segments.length; i++) {
     const seg = script.segments[i]!;
-    const audio = await synthesizeSegment(seg, env);
-    if (!audio) continue;
+    const result = await synthesizeSegment(seg, env);
+    if (!result) continue;
 
-    await env.PODCASTS!.put(`podcasts/${id}/${i}.mp3`, audio, {
-      httpMetadata: { contentType: 'audio/mpeg' },
+    const { buffer, ext } = result;
+    const contentType = ext === 'wav' ? 'audio/wav' : 'audio/aac';
+    await env.PODCASTS!.put(`podcasts/${id}/${i}.${ext}`, buffer, {
+      httpMetadata: { contentType },
     });
     uploaded++;
     console.log(
-      `[Podcast/${format}] Segment ${i + 1}/${script.segments.length} OK (${Math.round(audio.byteLength / 1024)}KB)`,
+      `[Podcast/${format}] Segment ${i + 1}/${script.segments.length} OK — ${ext.toUpperCase()} (${Math.round(buffer.byteLength / 1024)}KB)`,
     );
   }
 
@@ -384,9 +441,10 @@ async function cleanupOldPodcasts(env: Env): Promise<void> {
   ).bind(cutoff).all<{ id: string; segment_count: number }>();
 
   for (const pod of old) {
-    const keys = Array.from(
-      { length: pod.segment_count },
-      (_, i) => `podcasts/${pod.id}/${i}.mp3`,
+    // Supprimer toutes les extensions possibles (wav / aac / mp3)
+    const exts = ['wav', 'aac', 'mp3'];
+    const keys = exts.flatMap((ext) =>
+      Array.from({ length: pod.segment_count }, (_, i) => `podcasts/${pod.id}/${i}.${ext}`),
     );
     if (keys.length > 0) await env.PODCASTS?.delete(keys);
     await env.DB.prepare('DELETE FROM podcast_feed WHERE id = ?').bind(pod.id).run();

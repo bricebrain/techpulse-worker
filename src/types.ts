@@ -18,6 +18,8 @@ export interface Env {
   DEEPSEEK_API_KEY?: string;
   // Clé pour sécuriser les routes d'écriture depuis l'app
   API_SECRET?: string;
+  // Hugging Face — Inference API (TTS Parler-TTS, etc.)
+  HF_TOKEN?: string;
   // Proxy FastAPI (Render) pour contourner le blocage IP Reddit
   REDDIT_PROXY_URL?: string;    // ex: https://techpulse-api.onrender.com
   REDDIT_PROXY_SECRET?: string; // partagé avec la variable reddit_proxy_secret de FastAPI

@@ -53,7 +53,7 @@ export default {
       return handleProxy(req, env, pathAfterProxy);
     }
 
-    // ── POST /classify/test — test Workers AI sur un titre ───────────────
+// ── POST /classify/test — test Workers AI sur un titre ───────────────
     if (method === 'POST' && path === '/classify/test') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       const body = await req.json<{ title?: string; content?: string }>().catch(() => null);
@@ -318,12 +318,16 @@ export default {
         if (!podId || isNaN(segIndex)) return err('Paramètres invalides');
         if (!env.PODCASTS) return err('R2 non configuré', 503);
 
-        const obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.mp3`);
+        // Ordre de priorité : wav (Parler-TTS) → aac → mp3 (anciens podcasts)
+        let obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.wav`);
+        let contentType = 'audio/wav';
+        if (!obj) { obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.aac`); contentType = 'audio/aac'; }
+        if (!obj) { obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.mp3`); contentType = 'audio/mpeg'; }
         if (!obj) return err('Segment audio introuvable', 404);
 
         return new Response(obj.body, {
           headers: {
-            'Content-Type': 'audio/mpeg',
+            'Content-Type': contentType,
             'Cache-Control': 'public, max-age=86400',
             'Access-Control-Allow-Origin': '*',
           },
