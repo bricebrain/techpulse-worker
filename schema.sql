@@ -53,12 +53,15 @@ CREATE TABLE IF NOT EXISTS podcast_feed (
   id             TEXT PRIMARY KEY,
   title          TEXT NOT NULL,
   theme          TEXT NOT NULL DEFAULT 'general',
+  format         TEXT NOT NULL DEFAULT 'daily',  -- 'daily' | 'deep_dive'
   generated_at   INTEGER NOT NULL,
   segment_count  INTEGER NOT NULL DEFAULT 0,
   segments_json  TEXT NOT NULL DEFAULT '[]',  -- [{id,type,speaker,text}] sans audioUri
   is_ready       INTEGER NOT NULL DEFAULT 0,
   created_at     TEXT NOT NULL
 );
+-- Migration pour les bases existantes (ignorer l'erreur si la colonne existe déjà)
+-- wrangler d1 execute techpulse --command="ALTER TABLE podcast_feed ADD COLUMN format TEXT NOT NULL DEFAULT 'daily'"
 
 -- Index pour les requêtes fréquentes
 CREATE INDEX IF NOT EXISTS idx_articles_theme       ON articles(theme);

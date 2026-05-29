@@ -1,8 +1,15 @@
 /**
  * Génération automatique de podcasts côté serveur.
  *
- * Flux :
- *   1. Fetch des meilleurs articles D1 des dernières 24h
+ * Deux formats :
+ *   1. TechBrief quotidien (vulgarisé) — 3 articles, ~10-12 min
+ *      Segments : intro → (headline + context + explanation + impact + transition) × 3 → outro
+ *
+ *   2. Deep Dive hebdomadaire (vendredi) — 1 sujet, ~18-20 min
+ *      Segments : intro → large_context → explanation → analogie → analysis → impact → future → conclusion
+ *
+ * Flux commun :
+ *   1. Fetch des meilleurs articles D1
  *   2. Script JSON via Groq (llama-3.3-70b)
  *   3. TTS segment par segment via OpenAI gpt-4o-mini-tts
  *   4. Upload MP3 dans R2  →  podcasts/{id}/{i}.mp3
@@ -12,11 +19,18 @@
 
 import type { Env } from './types';
 
-// ─── Types internes ───────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type SegmentType =
+  | 'intro' | 'headline' | 'context' | 'explanation' | 'impact'
+  | 'transition' | 'outro'
+  | 'large_context' | 'analogie' | 'analysis' | 'future' | 'conclusion';
+
+export type PodcastFormat = 'daily' | 'deep_dive';
 
 export interface PodcastSegment {
   id: string;
-  type: 'intro' | 'headline' | 'analysis' | 'transition' | 'outro';
+  type: SegmentType;
   speaker: 'host' | 'analyst';
   text: string;
 }
@@ -33,18 +47,18 @@ interface DbArticle {
   published_at: number | null;
 }
 
-// ─── Config voix (identique à l'app) ─────────────────────────────────────────
+// ─── Config voix ──────────────────────────────────────────────────────────────
 
 const VOICES: Record<'host' | 'analyst', { voice: string; instructions: string }> = {
   host: {
     voice: 'alloy',
     instructions:
-      'Tu es un présentateur tech passionné et dynamique. Parle avec énergie et enthousiasme, en variant les inflexions. Ton chaleureux, accessible et accrocheur.',
+      'Tu es un présentateur tech passionné et pédagogue. Parle avec chaleur et enthousiasme, de façon claire et accessible. Ton dynamique, accrocheur, qui donne envie d\'écouter la suite.',
   },
   analyst: {
     voice: 'onyx',
     instructions:
-      'Tu es un analyste tech expert et posé. Articule chaque point avec précision et autorité. Ton sérieux, informatif, légèrement dramatique sur les chiffres et insights importants.',
+      'Tu es un analyste tech expert. Articule chaque point avec précision et profondeur. Ton sérieux et informatif, mais toujours accessible — tu expliques sans jargon inutile.',
   },
 };
 
@@ -60,24 +74,29 @@ function todayFr(): string {
   });
 }
 
-// ─── Étape 1 : récupération des articles frais ────────────────────────────────
+// ─── Fetch articles ───────────────────────────────────────────────────────────
 
-async function fetchTopArticles(env: Env): Promise<DbArticle[]> {
-  // Articles des dernières 24h, tous thèmes confondus
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+async function fetchTopArticles(env: Env, limit: number, hoursBack: number): Promise<DbArticle[]> {
+  const cutoff = Date.now() - hoursBack * 60 * 60 * 1000;
   const { results } = await env.DB.prepare(
     `SELECT title, source_name, content, published_at
      FROM articles
      WHERE published_at > ?
      ORDER BY published_at DESC
-     LIMIT 20`,
-  ).bind(cutoff).all<DbArticle>();
+     LIMIT ?`,
+  ).bind(cutoff, limit).all<DbArticle>();
   return results;
 }
 
-// ─── Étape 2 : génération du script via Groq ──────────────────────────────────
+// ─── Parse script JSON généré par Groq ───────────────────────────────────────
 
-function parseScript(raw: string): PodcastScript | null {
+const VALID_TYPES = new Set<string>([
+  'intro', 'headline', 'context', 'explanation', 'impact',
+  'transition', 'outro',
+  'large_context', 'analogie', 'analysis', 'future', 'conclusion',
+]);
+
+function parseScript(raw: string, fallbackTitle: string): PodcastScript | null {
   try {
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return null;
@@ -92,9 +111,7 @@ function parseScript(raw: string): PodcastScript | null {
       .filter((s) => typeof s.text === 'string' && s.text.trim().length > 10)
       .map((s, i) => ({
         id: `seg_${i}`,
-        type: (['intro', 'headline', 'analysis', 'transition', 'outro'].includes(s.type ?? '')
-          ? s.type
-          : 'analysis') as PodcastSegment['type'],
+        type: (VALID_TYPES.has(s.type ?? '') ? s.type : 'analysis') as SegmentType,
         speaker: (s.speaker === 'analyst' ? 'analyst' : 'host') as PodcastSegment['speaker'],
         text: (s.text ?? '').trim(),
       }));
@@ -102,10 +119,9 @@ function parseScript(raw: string): PodcastScript | null {
     if (segments.length < 3) return null;
 
     return {
-      title:
-        typeof parsed.title === 'string' && parsed.title.trim()
-          ? parsed.title.trim()
-          : `TechBrief — ${todayFr()}`,
+      title: typeof parsed.title === 'string' && parsed.title.trim()
+        ? parsed.title.trim()
+        : fallbackTitle,
       segments,
     };
   } catch {
@@ -113,27 +129,52 @@ function parseScript(raw: string): PodcastScript | null {
   }
 }
 
-async function generateScript(
+// ─── Script quotidien vulgarisé (3 articles, ~10-12 min) ─────────────────────
+
+async function generateDailyScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
   const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
   if (!groqKey) {
-    console.warn('[Podcast] Aucune clé Groq — génération impossible');
+    console.warn('[Podcast] Aucune clé Groq');
     return null;
   }
 
-  const top = articles.slice(0, 5);
+  const top = articles.slice(0, 3);
   const articleList = top
     .map(
       (a, i) =>
-        `Article ${i + 1}: "${a.title}" (source: ${a.source_name})\nRésumé: ${(a.content ?? '').slice(0, 300).trim()}`,
+        `Article ${i + 1}: "${a.title}" (${a.source_name})\nRésumé: ${(a.content ?? '').slice(0, 400).trim()}`,
     )
     .join('\n\n');
 
-  const pairs = top
-    .map(() => `{"type":"headline","speaker":"host","text":"..."},{"type":"analysis","speaker":"analyst","text":"..."}`)
-    .join(',');
+  // Construire dynamiquement les blocs de segments pour chaque article
+  const articleBlocks = top.map((_, i) => {
+    const notLast = i < top.length - 1;
+    return (
+      `    {"type":"headline","speaker":"host","text":"Annonce en 25-30 mots de l'article ${i + 1}, formulation percutante"},\n` +
+      `    {"type":"context","speaker":"analyst","text":"Contexte en 130-140 mots : ce que l'auditeur doit savoir en fond pour comprendre, 'Pour bien comprendre il faut savoir que...'"},\n` +
+      `    {"type":"explanation","speaker":"host","text":"Explication en 110-120 mots : ce que ça signifie concrètement, 'En clair, ça veut dire que...', 'Concrètement pour vous...'"},\n` +
+      `    {"type":"impact","speaker":"analyst","text":"Impact en 90-100 mots : pourquoi c'est important, qui est concerné, quelles conséquences pratiques"}` +
+      (notLast ? `,\n    {"type":"transition","speaker":"host","text":"Transition fluide en 25-30 mots vers le sujet suivant"}` : '')
+    );
+  }).join(',\n');
+
+  const prompt =
+    `Voici ${top.length} articles tech du jour :\n\n${articleList}\n\n` +
+    `Génère un podcast de vulgarisation tech en français (~10-12 minutes) au format JSON EXACT :\n\n` +
+    `{\n  "title": "TechBrief — ${todayFr()}",\n  "segments": [\n` +
+    `    {"type":"intro","speaker":"host","text":"Introduction chaleureuse en 70-80 mots : accueillir l'auditeur, présenter les 3 sujets du jour avec enthousiasme"},\n` +
+    `${articleBlocks},\n` +
+    `    {"type":"outro","speaker":"host","text":"Conclusion en 55-65 mots : récap des 3 points clés, formule de fin chaleureuse"}\n` +
+    `  ]\n}\n\n` +
+    `RÈGLES :\n` +
+    `- Vulgarisation : accessible à quelqu'un sans background technique\n` +
+    `- context (analyst) : histoire, fond, "Tout a commencé quand...", "Il faut savoir que..."\n` +
+    `- explanation (host) : "Concrètement...", "En clair...", analogies simples du quotidien\n` +
+    `- impact (analyst) : chiffres, acteurs, conséquences réelles\n` +
+    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
 
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -144,47 +185,108 @@ async function generateScript(
       },
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
-        max_tokens: 2000,
+        max_tokens: 3500,
+        temperature: 0.75,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Tu es un producteur de podcast tech francophone spécialisé en vulgarisation. Tu rends la tech accessible à tous. Tu réponds UNIQUEMENT en JSON valide.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      }),
+      signal: AbortSignal.timeout(35_000),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Podcast/daily] Groq ${res.status}`);
+      return null;
+    }
+    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+    const raw = data?.choices?.[0]?.message?.content ?? '';
+    return parseScript(raw, `TechBrief — ${todayFr()}`);
+  } catch (e) {
+    console.warn('[Podcast/daily] Groq exception:', e);
+    return null;
+  }
+}
+
+// ─── Script Deep Dive hebdomadaire (1 sujet, ~18-20 min) ─────────────────────
+
+async function generateDeepDiveScript(
+  articles: DbArticle[],
+  env: Env,
+): Promise<PodcastScript | null> {
+  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+  if (!groqKey) return null;
+
+  // Sujet principal : article avec le plus de contenu disponible
+  const article = [...articles].sort((a, b) =>
+    (b.content?.length ?? 0) - (a.content?.length ?? 0),
+  )[0]!;
+  const content = (article.content ?? '').slice(0, 600).trim();
+  const shortTitle = article.title.slice(0, 55);
+
+  const prompt =
+    `Sujet du Deep Dive : "${article.title}" (${article.source_name})\n` +
+    (content ? `Contenu disponible : ${content}\n` : '') +
+    `\nGénère un podcast Deep Dive pédagogique en français (~18-20 minutes) au format JSON EXACT :\n\n` +
+    `{\n  "title": "🔬 Deep Dive : ${shortTitle}",\n  "segments": [\n` +
+    `    {"type":"intro","speaker":"host","text":"Introduction percutante en 90-100 mots : accrocher l'auditeur dès la 1ère phrase, poser la question centrale, annoncer le voyage de compréhension"},\n` +
+    `    {"type":"large_context","speaker":"analyst","text":"Contexte historique et fondamentaux en 370-390 mots : d'où vient cette techno/tendance, son évolution sur 5-10 ans, les concepts de base, pourquoi ça existe, 'Tout a commencé...'"},\n` +
+    `    {"type":"explanation","speaker":"host","text":"Explication progressive en 290-310 mots : comment ça fonctionne vraiment, par étapes claires, du plus simple au plus complexe, sans jargon inutile"},\n` +
+    `    {"type":"analogie","speaker":"host","text":"Analogie du quotidien en 240-260 mots : DOIT commencer par 'Imaginez que...' ou 'C'est exactement comme si...', une comparaison concrète avec la vie de tous les jours pour ancrer la compréhension intuitive"},\n` +
+    `    {"type":"analysis","speaker":"analyst","text":"Analyse technique approfondie en 360-380 mots : les mécanismes clés, les acteurs principaux, les chiffres importants, les défis, les enjeux techniques réels"},\n` +
+    `    {"type":"impact","speaker":"analyst","text":"Impacts sectoriels en 280-300 mots : transformation de l'emploi, économie, société, quels secteurs sont disrupted, qui perd, qui gagne, exemples concrets"},\n` +
+    `    {"type":"future","speaker":"host","text":"Perspectives futures en 260-280 mots : dans 3 ans, dans 10 ans, les scénarios optimiste et pessimiste, 'D'ici 2027...', 'Le scénario qui se dessine...', les signaux faibles à surveiller"},\n` +
+    `    {"type":"conclusion","speaker":"host","text":"Synthèse en 110-130 mots : les 3 points essentiels à retenir, pourquoi continuer à suivre ce sujet, formule de fin qui donne envie de revenir"}\n` +
+    `  ]\n}\n\n` +
+    `RÈGLES ABSOLUES :\n` +
+    `- Pédagogie par couches : chaque segment construit sur le précédent\n` +
+    `- large_context : commencer dans le passé et progresser vers le présent\n` +
+    `- analogie : OBLIGATOIREMENT commencer par "Imaginez que..." ou "C'est exactement comme si..."\n` +
+    `- future : oser les projections concrètes avec des dates approximatives\n` +
+    `- Respecter les word counts pour atteindre 18-20 minutes de contenu total\n` +
+    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${groqKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 5000,
         temperature: 0.8,
         messages: [
           {
             role: 'system',
             content:
-              "Tu es un producteur de podcast tech pour francophones. Tu génères des scripts courts, dynamiques et naturels à l'oral. Réponds UNIQUEMENT en JSON valide.",
+              'Tu es un journaliste tech expert, pédagogue et passionné. Tu crées des contenus audio longs, approfondis et accessibles. Tu réponds UNIQUEMENT en JSON valide.',
           },
-          {
-            role: 'user',
-            content:
-              `Voici ${top.length} article${top.length > 1 ? 's' : ''} tech :\n\n${articleList}\n\n` +
-              `Génère un script de podcast en français avec cette structure JSON exacte :\n` +
-              `{"title":"TechBrief — ${todayFr()}","segments":[` +
-              `{"type":"intro","speaker":"host","text":"..."},` +
-              `${pairs},` +
-              `{"type":"outro","speaker":"host","text":"..."}]}\n\n` +
-              `Règles : intro 40-50 mots, headline 15-25 mots, analysis 100-140 mots, outro 35-45 mots. Naturel à l'oral, sans markdown.`,
-          },
+          { role: 'user', content: prompt },
         ],
       }),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(45_000),
     });
 
     if (!res.ok) {
-      console.warn(`[Podcast] Groq API ${res.status}`);
+      console.warn(`[Podcast/deep_dive] Groq ${res.status}`);
       return null;
     }
-
-    const data = await res.json<{
-      choices?: { message?: { content?: string } }[];
-    }>();
+    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
     const raw = data?.choices?.[0]?.message?.content ?? '';
-    return parseScript(raw);
+    return parseScript(raw, `🔬 Deep Dive — ${todayFr()}`);
   } catch (e) {
-    console.warn('[Podcast] Groq exception:', e);
+    console.warn('[Podcast/deep_dive] Groq exception:', e);
     return null;
   }
 }
 
-// ─── Étape 3 : TTS via OpenAI ─────────────────────────────────────────────────
+// ─── TTS segment par segment ──────────────────────────────────────────────────
 
 async function synthesizeSegment(
   segment: PodcastSegment,
@@ -221,7 +323,59 @@ async function synthesizeSegment(
   }
 }
 
-// ─── Nettoyage des anciens podcasts ───────────────────────────────────────────
+// ─── Upload R2 + sauvegarde D1 ────────────────────────────────────────────────
+
+async function uploadAndSave(
+  script: PodcastScript,
+  format: PodcastFormat,
+  env: Env,
+): Promise<string | null> {
+  const id = makePodcastId();
+  const generatedAt = Date.now();
+  let uploaded = 0;
+
+  for (let i = 0; i < script.segments.length; i++) {
+    const seg = script.segments[i]!;
+    const audio = await synthesizeSegment(seg, env);
+    if (!audio) continue;
+
+    await env.PODCASTS!.put(`podcasts/${id}/${i}.mp3`, audio, {
+      httpMetadata: { contentType: 'audio/mpeg' },
+    });
+    uploaded++;
+    console.log(
+      `[Podcast/${format}] Segment ${i + 1}/${script.segments.length} OK (${Math.round(audio.byteLength / 1024)}KB)`,
+    );
+  }
+
+  if (uploaded < Math.ceil(script.segments.length * 0.5)) {
+    console.warn(
+      `[Podcast/${format}] Trop peu de segments audio (${uploaded}/${script.segments.length}) — non sauvegardé`,
+    );
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO podcast_feed (id, title, theme, format, generated_at, segment_count, segments_json, is_ready, created_at)
+     VALUES (?, ?, 'general', ?, ?, ?, ?, 1, ?)`,
+  ).bind(
+    id,
+    script.title,
+    format,
+    generatedAt,
+    script.segments.length,
+    JSON.stringify(script.segments),
+    now,
+  ).run();
+
+  console.log(
+    `[Podcast/${format}] ✓ Sauvegardé : ${id} (${uploaded}/${script.segments.length} segments)`,
+  );
+  return id;
+}
+
+// ─── Nettoyage des podcasts > 7 jours ────────────────────────────────────────
 
 async function cleanupOldPodcasts(env: Env): Promise<void> {
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -230,26 +384,27 @@ async function cleanupOldPodcasts(env: Env): Promise<void> {
   ).bind(cutoff).all<{ id: string; segment_count: number }>();
 
   for (const pod of old) {
-    // Supprimer les MP3 dans R2
     const keys = Array.from(
       { length: pod.segment_count },
       (_, i) => `podcasts/${pod.id}/${i}.mp3`,
     );
-    if (keys.length > 0) {
-      await env.PODCASTS?.delete(keys);
-    }
+    if (keys.length > 0) await env.PODCASTS?.delete(keys);
     await env.DB.prepare('DELETE FROM podcast_feed WHERE id = ?').bind(pod.id).run();
   }
 
   if (old.length > 0) {
-    console.log(`[Podcast] ${old.length} ancien(s) podcast(s) nettoyé(s)`);
+    console.log(`[Podcast] ${old.length} ancien(s) nettoyé(s)`);
   }
 }
 
-// ─── Export principal ─────────────────────────────────────────────────────────
+// ─── Exports ──────────────────────────────────────────────────────────────────
 
+/**
+ * TechBrief quotidien vulgarisé — ~10-12 min, 3 articles.
+ * Cron : 0 6 * * * (chaque jour à 6h UTC)
+ */
 export async function generateDailyPodcast(env: Env): Promise<void> {
-  console.log('[Podcast] Démarrage génération quotidienne…');
+  console.log('[Podcast] Démarrage TechBrief quotidien…');
 
   if (!env.PODCASTS) {
     console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
@@ -260,61 +415,55 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
     return;
   }
 
-  // 1. Articles frais
-  const articles = await fetchTopArticles(env);
+  const articles = await fetchTopArticles(env, 20, 24);
   if (articles.length < 3) {
-    console.log(`[Podcast] Seulement ${articles.length} articles frais — podcast annulé`);
+    console.log(`[Podcast] Seulement ${articles.length} articles frais — TechBrief annulé`);
     return;
   }
-  console.log(`[Podcast] ${articles.length} articles disponibles`);
+  console.log(`[Podcast/daily] ${articles.length} articles disponibles`);
 
-  // 2. Script
-  const script = await generateScript(articles, env);
+  const script = await generateDailyScript(articles, env);
   if (!script) {
-    console.warn('[Podcast] Échec génération script');
+    console.warn('[Podcast/daily] Échec génération script');
     return;
   }
-  console.log(`[Podcast] Script OK : "${script.title}" (${script.segments.length} segments)`);
+  console.log(`[Podcast/daily] Script OK : "${script.title}" (${script.segments.length} segments)`);
 
-  // 3. TTS + upload R2
-  const id = makePodcastId();
-  const generatedAt = Date.now();
-  let uploaded = 0;
-
-  for (let i = 0; i < script.segments.length; i++) {
-    const seg = script.segments[i]!;
-    const audio = await synthesizeSegment(seg, env);
-    if (!audio) continue;
-
-    await env.PODCASTS.put(`podcasts/${id}/${i}.mp3`, audio, {
-      httpMetadata: { contentType: 'audio/mpeg' },
-    });
-    uploaded++;
-    console.log(`[Podcast] Segment ${i + 1}/${script.segments.length} uploadé (${audio.byteLength} bytes)`);
-  }
-
-  // Abort si trop peu de segments ont du son (au moins 50%)
-  if (uploaded < Math.ceil(script.segments.length * 0.5)) {
-    console.warn(`[Podcast] Trop peu de segments audio (${uploaded}/${script.segments.length}) — podcast non sauvegardé`);
-    return;
-  }
-
-  // 4. Sauvegarde D1
-  const now = new Date().toISOString();
-  await env.DB.prepare(
-    `INSERT INTO podcast_feed (id, title, theme, generated_at, segment_count, segments_json, is_ready, created_at)
-     VALUES (?, ?, 'general', ?, ?, ?, 1, ?)`,
-  ).bind(
-    id,
-    script.title,
-    generatedAt,
-    script.segments.length,
-    JSON.stringify(script.segments),
-    now,
-  ).run();
-
-  console.log(`[Podcast] ✓ Podcast sauvegardé : ${id} (${uploaded}/${script.segments.length} segments audio)`);
-
-  // 5. Nettoyage
+  await uploadAndSave(script, 'daily', env);
   await cleanupOldPodcasts(env);
+}
+
+/**
+ * Deep Dive hebdomadaire pédagogique — ~18-20 min, 1 sujet approfondi.
+ * Cron : 0 6 * * 5 (vendredi à 6h UTC)
+ */
+export async function generateDeepDivePodcast(env: Env): Promise<void> {
+  console.log('[Podcast] Démarrage Deep Dive hebdomadaire…');
+
+  if (!env.PODCASTS) {
+    console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
+    return;
+  }
+  if (!env.OPENAI_API_KEY) {
+    console.warn('[Podcast] OPENAI_API_KEY manquant — TTS impossible');
+    return;
+  }
+
+  // Articles de la semaine pour choisir le sujet le plus riche
+  const articles = await fetchTopArticles(env, 50, 7 * 24);
+  if (articles.length < 1) {
+    console.log('[Podcast] Aucun article cette semaine — Deep Dive annulé');
+    return;
+  }
+  console.log(`[Podcast/deep_dive] ${articles.length} articles candidats`);
+
+  const script = await generateDeepDiveScript(articles, env);
+  if (!script) {
+    console.warn('[Podcast/deep_dive] Échec génération script');
+    return;
+  }
+  console.log(`[Podcast/deep_dive] Script OK : "${script.title}" (${script.segments.length} segments)`);
+
+  await uploadAndSave(script, 'deep_dive', env);
+  // Le cleanup est fait par generateDailyPodcast — pas besoin de le doubler le vendredi
 }

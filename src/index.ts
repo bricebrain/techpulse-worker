@@ -1,6 +1,6 @@
 import type { Env, Source } from './types';
 import { runCron, fetchAndStoreSource } from './cron';
-import { generateDailyPodcast } from './podcast';
+import { generateDailyPodcast, generateDeepDivePodcast } from './podcast';
 import { generateSuggestions } from './suggester';
 import type { DbSuggestion } from './suggester';
 import { json, err, isAuthorized, makeHash } from './utils';
@@ -16,6 +16,10 @@ export default {
         await runCron(env);
         if (event.cron === '0 6 * * *') {
           await generateDailyPodcast(env);
+        }
+        if (event.cron === '0 6 * * 5') {
+          // Vendredi : Deep Dive hebdomadaire (le TechBrief quotidien tourne aussi ce jour-là)
+          await generateDeepDivePodcast(env);
         }
         if (event.cron === '0 7 * * *') {
           await generateSuggestions(env);
@@ -278,13 +282,14 @@ export default {
     if (method === 'GET' && path === '/podcasts') {
       const limit = Math.min(Number(url.searchParams.get('limit') ?? '7'), 20);
       const { results } = await env.DB.prepare(
-        `SELECT id, title, theme, generated_at, segment_count, segments_json, created_at
+        `SELECT id, title, theme, COALESCE(format, 'daily') as format,
+                generated_at, segment_count, segments_json, created_at
          FROM podcast_feed
          WHERE is_ready = 1
          ORDER BY generated_at DESC
          LIMIT ?`,
       ).bind(limit).all<{
-        id: string; title: string; theme: string;
+        id: string; title: string; theme: string; format: string;
         generated_at: number; segment_count: number;
         segments_json: string; created_at: string;
       }>();
@@ -293,6 +298,7 @@ export default {
         id: p.id,
         title: p.title,
         theme: p.theme,
+        format: p.format,
         generated_at: p.generated_at,
         segment_count: p.segment_count,
         segments: (() => { try { return JSON.parse(p.segments_json); } catch { return []; } })(),
@@ -325,11 +331,18 @@ export default {
       }
     }
 
-    // ── POST /podcasts/generate — déclencher la génération manuellement ───
+    // ── POST /podcasts/generate — TechBrief quotidien manuellement ────────
     if (method === 'POST' && path === '/podcasts/generate') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       ctx.waitUntil(generateDailyPodcast(env));
-      return json({ message: 'Génération podcast lancée en arrière-plan' });
+      return json({ message: 'Génération TechBrief lancée en arrière-plan' });
+    }
+
+    // ── POST /podcasts/generate-deep-dive — Deep Dive manuellement ─────────
+    if (method === 'POST' && path === '/podcasts/generate-deep-dive') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      ctx.waitUntil(generateDeepDivePodcast(env));
+      return json({ message: 'Génération Deep Dive lancée en arrière-plan' });
     }
 
     // ── GET /suggestions — liste des suggestions en attente ──────────────
