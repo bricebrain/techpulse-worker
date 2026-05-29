@@ -32,6 +32,22 @@ CREATE TABLE IF NOT EXISTS config (
   updated_at TEXT NOT NULL
 );
 
+-- Suggestions IA (thèmes émergents + chaînes YouTube)
+CREATE TABLE IF NOT EXISTS suggestions (
+  id           TEXT PRIMARY KEY,
+  type         TEXT NOT NULL,           -- 'new_theme' | 'youtube_channel'
+  name         TEXT NOT NULL,           -- Nom affiché
+  description  TEXT NOT NULL,           -- Pourquoi c'est suggéré
+  theme        TEXT,                    -- Thème cible (pour youtube_channel)
+  value        TEXT NOT NULL,           -- slug pour new_theme, channel_id pour youtube
+  extra_json   TEXT NOT NULL DEFAULT '{}', -- sources de démarrage pour new_theme
+  generated_at INTEGER NOT NULL,
+  is_applied   INTEGER NOT NULL DEFAULT 0,
+  is_dismissed INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_suggestions_active ON suggestions(is_applied, is_dismissed);
+
 -- Podcasts auto-générés par le cron quotidien
 CREATE TABLE IF NOT EXISTS podcast_feed (
   id             TEXT PRIMARY KEY,

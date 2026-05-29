@@ -1,6 +1,8 @@
 import type { Env, Source } from './types';
 import { runCron, fetchAndStoreSource } from './cron';
 import { generateDailyPodcast } from './podcast';
+import { generateSuggestions } from './suggester';
+import type { DbSuggestion } from './suggester';
 import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
@@ -14,6 +16,9 @@ export default {
         await runCron(env);
         if (event.cron === '0 6 * * *') {
           await generateDailyPodcast(env);
+        }
+        if (event.cron === '0 8 * * 1') {
+          await generateSuggestions(env);
         }
       })(),
     );
@@ -325,6 +330,103 @@ export default {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       ctx.waitUntil(generateDailyPodcast(env));
       return json({ message: 'Génération podcast lancée en arrière-plan' });
+    }
+
+    // ── GET /suggestions — liste des suggestions en attente ──────────────
+    if (method === 'GET' && path === '/suggestions') {
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM suggestions
+         WHERE is_applied = 0 AND is_dismissed = 0
+         ORDER BY generated_at DESC`,
+      ).all<DbSuggestion>();
+
+      const suggestions = results.map((s) => ({
+        ...s,
+        extra: (() => { try { return JSON.parse(s.extra_json); } catch { return {}; } })(),
+      }));
+
+      return json({ suggestions, count: suggestions.length });
+    }
+
+    // ── POST /suggestions/:id/apply — appliquer une suggestion ───────────
+    if (method === 'POST' && path.startsWith('/suggestions/') && path.endsWith('/apply')) {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const id = path.split('/')[2];
+      const sug = await env.DB.prepare(
+        'SELECT * FROM suggestions WHERE id = ?',
+      ).bind(id).first<DbSuggestion>();
+
+      if (!sug) return err('Suggestion introuvable', 404);
+
+      const now = new Date().toISOString();
+
+      if (sug.type === 'youtube_channel') {
+        // Ajouter directement comme source
+        const sourceId = `src_sug_${Math.random().toString(36).slice(2, 8)}`;
+        const theme = sug.theme ?? 'general';
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO sources
+             (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
+           VALUES (?, ?, ?, 'youtube_channel', ?, 8, 1, 0, ?, ?)`,
+        ).bind(sourceId, sug.name, theme, sug.value, now, now).run();
+        ctx.waitUntil(
+          (async () => {
+            const src = { id: sourceId, name: sug.name, theme, type: 'youtube_channel' as const, value: sug.value, limit_count: 8, is_active: 1, is_default: 0, created_at: now, updated_at: now };
+            const { fetchAndStoreSource } = await import('./cron');
+            await fetchAndStoreSource(src, env);
+          })(),
+        );
+      } else if (sug.type === 'new_theme') {
+        // Ajouter les sources de démarrage
+        const extra = (() => { try { return JSON.parse(sug.extra_json); } catch { return {}; } })();
+        const starters: Array<{ type: string; name: string; value: string }> = extra.starter_sources ?? [];
+        const stmts = starters.map((src) => {
+          const sourceId = `src_sug_${Math.random().toString(36).slice(2, 8)}`;
+          return env.DB.prepare(
+            `INSERT OR IGNORE INTO sources
+               (id, name, theme, type, value, limit_count, is_active, is_default, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 8, 1, 0, ?, ?)`,
+          ).bind(sourceId, src.name, sug.value, src.type, src.value, now, now);
+        });
+        if (stmts.length) await env.DB.batch(stmts);
+        // Fetch immédiat des nouvelles sources
+        ctx.waitUntil(
+          (async () => {
+            const { fetchAndStoreSource } = await import('./cron');
+            for (const src of starters) {
+              const sourceId = `src_sug_${Math.random().toString(36).slice(2, 6)}`;
+              const s = { id: sourceId, name: src.name, theme: sug.value, type: src.type as 'youtube_channel' | 'rss', value: src.value, limit_count: 8, is_active: 1, is_default: 0, created_at: now, updated_at: now };
+              await fetchAndStoreSource(s, env);
+            }
+          })(),
+        );
+      }
+
+      await env.DB.prepare(
+        'UPDATE suggestions SET is_applied = 1 WHERE id = ?',
+      ).bind(id).run();
+
+      return json({ message: 'Suggestion appliquée', id });
+    }
+
+    // ── DELETE /suggestions/:id — ignorer une suggestion ─────────────────
+    if (method === 'DELETE' && path.startsWith('/suggestions/')) {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const id = path.split('/')[2];
+      await env.DB.prepare(
+        'UPDATE suggestions SET is_dismissed = 1 WHERE id = ?',
+      ).bind(id).run();
+
+      return json({ message: 'Suggestion ignorée', id });
+    }
+
+    // ── POST /suggestions/generate — déclencher manuellement ─────────────
+    if (method === 'POST' && path === '/suggestions/generate') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      ctx.waitUntil(generateSuggestions(env));
+      return json({ message: 'Analyse de suggestions lancée en arrière-plan' });
     }
 
     return err('Route inconnue', 404);

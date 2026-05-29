@@ -16,4 +16,4 @@ bucket_name = "techpulse-podcasts"
 binding = "AI"
 
 [triggers]
-crons = ["0 */2 * * *", "0 6 * * *"]  # articles toutes les 2h + podcast quotidien à 6h UTC
+crons = ["0 */2 * * *", "0 6 * * *", "0 8 * * 1"]  # articles 2h + podcast 6h + suggestions lundi 8h UTC
