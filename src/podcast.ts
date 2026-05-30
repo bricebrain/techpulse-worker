@@ -407,9 +407,9 @@ async function synthesizeViaFastApi(
       },
       body: JSON.stringify({
         text: segment.text,
-        voice: segment.speaker, // "host" | "analyst" → mappé dans parler_provider.py
-        provider: 'parler_hf',
-        response_format: 'wav',
+        voice: segment.speaker, // "host" | "analyst" → mappé dans edge_provider.py
+        provider: 'edge_tts',
+        response_format: 'mp3',
       }),
       signal: AbortSignal.timeout(90_000), // Parler-TTS peut prendre 20-60s (cold start HF)
     });
@@ -463,15 +463,15 @@ async function synthesizeViaOpenAI(
 async function synthesizeSegment(
   segment: PodcastSegment,
   env: Env,
-): Promise<{ buffer: ArrayBuffer; ext: 'wav' | 'aac' } | null> {
-  // Essayer Parler-TTS via FastAPI (gratuit)
-  const hfAudio = await synthesizeViaFastApi(segment, env);
-  if (hfAudio) {
-    console.log(`[Podcast] Segment ${segment.id} → Parler-TTS HF ✓`);
-    return { buffer: hfAudio, ext: 'wav' };
+): Promise<{ buffer: ArrayBuffer; ext: 'mp3' | 'aac' } | null> {
+  // Priorité : Edge-TTS via FastAPI (gratuit, voix neurales FR)
+  const edgeAudio = await synthesizeViaFastApi(segment, env);
+  if (edgeAudio) {
+    console.log(`[Podcast] Segment ${segment.id} → Edge-TTS ✓`);
+    return { buffer: edgeAudio, ext: 'mp3' };
   }
 
-  // Fallback OpenAI
+  // Fallback : OpenAI gpt-4o-mini-tts
   console.warn(`[Podcast] Fallback OpenAI TTS pour ${segment.id}`);
   const oaiAudio = await synthesizeViaOpenAI(segment, env);
   if (oaiAudio) return { buffer: oaiAudio, ext: 'aac' };
