@@ -164,20 +164,13 @@ async function deduplicateWithEmbeddings(
 
 interface FrenchContent { title_fr: string; summary_fr: string }
 
-async function generateFrenchBatch(
-  articles: { hash: string; title: string; content: string | null }[],
-  env: Env,
-): Promise<Map<string, FrenchContent>> {
-  const results = new Map<string, FrenchContent>();
-  if (!articles.length || !env.GEMINI_API_KEY) return results;
-
+function buildTranslationPrompt(articles: { hash: string; title: string; content: string | null }[]): string {
   const input = articles.map((a) => ({
     hash: a.hash,
     title: a.title,
     excerpt: (a.content ?? '').slice(0, 200),
   }));
-
-  const prompt = `Tu es journaliste tech francophone. Pour chaque article JSON ci-dessous, génère :
+  return `Tu es journaliste tech francophone. Pour chaque article JSON ci-dessous, génère :
 - "title_fr" : titre traduit en français, concis et fidèle
 - "summary_fr" : exactement 3 phrases narratives en français, style commentateur radio matinal, sans bullet, sans markdown, sans guillemets autour des phrases
 
@@ -185,12 +178,25 @@ Articles : ${JSON.stringify(input)}
 
 Réponds UNIQUEMENT avec un tableau JSON valide (aucun texte avant ou après) :
 [{"hash":"...","title_fr":"...","summary_fr":"..."},...]`;
+}
 
+function parseFrenchResults(text: string): Array<{ hash: string; title_fr: string; summary_fr: string }> {
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return [];
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 25_000);
+    return (JSON.parse(match[0]) as Array<{ hash?: string; title_fr?: string; summary_fr?: string }>)
+      .filter((i): i is { hash: string; title_fr: string; summary_fr: string } =>
+        Boolean(i.hash && i.title_fr && i.summary_fr));
+  } catch { return []; }
+}
+
+/** Appel Gemini Flash 2.0 (primaire) */
+async function callGemini(prompt: string, apiKey: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25_000);
+  try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,24 +207,64 @@ Réponds UNIQUEMENT avec un tableau JSON valide (aucun texte avant ou après) :
         signal: controller.signal,
       },
     ).finally(() => clearTimeout(timer));
-
-    if (!res.ok) { console.warn(`[FR] Gemini ${res.status}`); return results; }
-
+    if (!res.ok) { console.warn(`[FR] Gemini ${res.status}`); return null; }
     const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) { console.warn('[FR] Réponse non parsable:', text.slice(0, 200)); return results; }
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+  } catch (e) { console.warn('[FR] Gemini error:', e); return null; }
+}
 
-    const parsed = JSON.parse(match[0]) as { hash: string; title_fr?: string; summary_fr?: string }[];
-    for (const item of parsed) {
-      if (item.hash && item.title_fr && item.summary_fr) {
-        results.set(item.hash, { title_fr: item.title_fr, summary_fr: item.summary_fr });
-      }
-    }
-    console.log(`[FR] ${results.size}/${articles.length} articles traduits`);
-  } catch (e) {
-    console.warn('[FR] Erreur batch:', e);
+/** Fallback DeepSeek (OpenAI-compatible) quand Gemini est en 429/quota */
+async function callDeepSeek(prompt: string, apiKey: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 4096,
+      }),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+    if (!res.ok) { console.warn(`[FR] DeepSeek ${res.status}`); return null; }
+    const data = await res.json() as { choices?: { message?: { content?: string } }[] };
+    return data?.choices?.[0]?.message?.content ?? null;
+  } catch (e) { console.warn('[FR] DeepSeek error:', e); return null; }
+}
+
+async function generateFrenchBatch(
+  articles: { hash: string; title: string; content: string | null }[],
+  env: Env,
+): Promise<Map<string, FrenchContent>> {
+  const results = new Map<string, FrenchContent>();
+  if (!articles.length) return results;
+
+  const prompt = buildTranslationPrompt(articles);
+
+  // Primaire : Gemini Flash 2.0
+  let text: string | null = null;
+  if (env.GEMINI_API_KEY) {
+    text = await callGemini(prompt, env.GEMINI_API_KEY);
   }
+
+  // Fallback : DeepSeek (quota indépendant de Gemini)
+  if (!text && env.DEEPSEEK_API_KEY) {
+    console.log('[FR] Gemini indispo → fallback DeepSeek');
+    text = await callDeepSeek(prompt, env.DEEPSEEK_API_KEY);
+  }
+
+  if (!text) { console.warn('[FR] Aucun provider disponible'); return results; }
+
+  const parsed = parseFrenchResults(text);
+  if (!parsed.length) { console.warn('[FR] Réponse non parsable:', text.slice(0, 200)); return results; }
+
+  for (const item of parsed) {
+    results.set(item.hash, { title_fr: item.title_fr, summary_fr: item.summary_fr });
+  }
+  console.log(`[FR] ${results.size}/${articles.length} articles traduits`);
   return results;
 }
 
@@ -348,17 +394,18 @@ export async function runCronEnrich(env: Env): Promise<void> {
 
   // 1. Traduction française + résumé narratif
   if (env.GEMINI_API_KEY) {
-    // LIMIT 50 = 2 appels Gemini max par run (évite les timeouts Worker)
+    // LIMIT 20 = 2 appels Gemini (batch=10) par run → reste sous les rate limits
     // Les articles restants sont traduits lors des prochains runs (toutes les 2h)
     const { results: untranslated } = await env.DB.prepare(
-      `SELECT hash, title, content FROM articles WHERE title_fr IS NULL ORDER BY fetched_at DESC LIMIT 50`,
+      `SELECT hash, title, content FROM articles WHERE title_fr IS NULL ORDER BY fetched_at DESC LIMIT 20`,
     ).all<{ hash: string; title: string; content: string | null }>();
 
     if (untranslated.length > 0) {
       console.log(`[Cron/Enrich] Traduction FR : ${untranslated.length} articles`);
-      const FR_BATCH = 25;
+      const FR_BATCH = 10; // batch réduit pour respecter les rate limits Gemini
       let totalUpdated = 0;
       for (let i = 0; i < untranslated.length; i += FR_BATCH) {
+        if (i > 0) await new Promise((r) => setTimeout(r, 4_000)); // 4s entre batches
         const frMap = await generateFrenchBatch(untranslated.slice(i, i + FR_BATCH), env);
         if (frMap.size > 0) {
           const stmts = Array.from(frMap.entries()).map(([hash, fr]) =>
@@ -374,7 +421,7 @@ export async function runCronEnrich(env: Env): Promise<void> {
   }
 
   // 2. Classification Workers AI (articles récents sans classified_theme)
-  const recent = Date.now() - 4 * 60 * 60 * 1000; // fenêtre 4h
+  const recent = Date.now() - 2 * 60 * 60 * 1000; // fenêtre 2h (aligne sur le cron)
   const { results: toClassify } = await env.DB.prepare(
     `SELECT hash, theme, title, source_name, url, content, published_at, fetched_at
      FROM articles WHERE classified_theme IS NULL AND fetched_at > ?`

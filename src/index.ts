@@ -23,8 +23,9 @@ export default {
           return;
         }
         // ── Enrichissement (2h) : traduction FR + classification ─────────────
+        // NE PAS appeler runCronFetch ici — le cron 30min s'en charge déjà.
+        // Garder le budget subrequests entier pour Workers AI (classifier).
         if (event.cron === '0 */2 * * *') {
-          await runCronFetch(env);   // fetch d'abord pour avoir les derniers articles
           await runCronEnrich(env);
           return;
         }
