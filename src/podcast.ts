@@ -467,7 +467,7 @@ async function uploadAndSave(
     if (!result) continue;
 
     const { buffer, ext } = result;
-    const contentType = ext === 'wav' ? 'audio/wav' : 'audio/aac';
+    const contentType = ext === 'mp3' ? 'audio/mpeg' : 'audio/aac';
     await env.PODCASTS!.put(`podcasts/${id}/${i}.${ext}`, buffer, {
       httpMetadata: { contentType },
     });

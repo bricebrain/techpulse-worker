@@ -6,6 +6,75 @@ import { classifyAndStore } from './classifier';
 
 const ARTICLE_TTL_DAYS = 7;
 
+// ─── Déduplication par similarité de titre ───────────────────────────────────
+// Jaccard sur les mots significatifs : si ≥ 45 % des mots se recoupent
+// → même sujet traité par une autre source → on ignore.
+
+const STOPWORDS = new Set([
+  // Anglais
+  'the','a','an','in','on','at','to','for','of','and','or','is','are','was',
+  'were','it','its','with','from','by','about','that','this','new','first',
+  'how','why','what','when','where','will','can','has','have','been','after',
+  'into','up','out','as','be','but','not','so','do','did','get','got','they',
+  'we','our','you','he','she','his','her','their','more','just','over','than',
+  'now','all','one','two','three','could','would','should','which','while',
+  // Français
+  'le','la','les','un','une','des','du','de','en','et','est','que','qui',
+  'il','elle','ils','elles','dans','sur','pour','par','avec','au','aux',
+  'ce','cette','ces','je','me','ma','mon','mes','se','son','sa','ses','lui',
+  'leur','leurs','ne','pas','plus','très','bien','tout','tous','toute',
+  'après','avant','même','aussi','comme','mais','ou','donc','car','si',
+]);
+
+const DEDUP_THRESHOLD = 0.45;
+const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
+
+function titleToWords(title: string): Set<string> {
+  return new Set(
+    title
+      .toLowerCase()
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')   // strip accents
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !STOPWORDS.has(w)),
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const w of a) if (b.has(w)) intersection++;
+  return intersection / (a.size + b.size - intersection);
+}
+
+/**
+ * Filtre les doublons near-sémantiques d'un lot d'articles.
+ * `existingTitles` = titres déjà en base (dernières 24h).
+ * Retourne les articles uniques + le nombre de doublons éliminés.
+ */
+function deduplicateArticles(
+  articles: Article[],
+  existingTitles: string[],
+): { unique: Article[]; skipped: number } {
+  const seen: Set<string>[] = existingTitles.map(titleToWords);
+  const unique: Article[] = [];
+  let skipped = 0;
+
+  for (const article of articles) {
+    const words = titleToWords(article.title);
+    const isDup = seen.some((s) => jaccard(words, s) >= DEDUP_THRESHOLD);
+    if (isDup) {
+      skipped++;
+      console.log(`[Dédup] Ignoré (doublon) : "${article.title.slice(0, 70)}"`);
+    } else {
+      unique.push(article);
+      seen.push(words);
+    }
+  }
+
+  return { unique, skipped };
+}
+
 export async function runCron(env: Env): Promise<void> {
   console.log('[Cron] Démarrage du fetch de veille…');
 
@@ -32,8 +101,20 @@ export async function runCron(env: Env): Promise<void> {
 
   console.log(`[Cron] ${allArticles.length} articles récupérés`);
 
-  // 3. Upsert dans D1 par batch de 50
-  const articleChunks = chunkArray(allArticles, 50);
+  // 3. Déduplication : on compare les titres avec les articles des 24 dernières heures
+  const dedupCutoff = Date.now() - DEDUP_WINDOW_MS;
+  const { results: recentTitles } = await env.DB.prepare(
+    'SELECT title FROM articles WHERE fetched_at > ?'
+  ).bind(dedupCutoff).all<{ title: string }>();
+
+  const { unique: articlesToStore, skipped } = deduplicateArticles(
+    allArticles,
+    recentTitles.map((r) => r.title),
+  );
+  console.log(`[Cron] Dédup : ${allArticles.length} → ${articlesToStore.length} articles (${skipped} doublons éliminés)`);
+
+  // 4. Upsert dans D1 par batch de 50
+  const articleChunks = chunkArray(articlesToStore, 50);
   for (const batch of articleChunks) {
     const stmts = batch.map((a) =>
       env.DB.prepare(
@@ -47,11 +128,11 @@ export async function runCron(env: Env): Promise<void> {
     await env.DB.batch(stmts);
   }
 
-  // 4. Classification Workers AI
+  // 5. Classification Workers AI
   // - YouTube : tous les articles (thème source = 'youtube', contenu varié)
   // - Autres  : seulement les nouveaux articles sans classified_theme
-  const youtubeArticles = allArticles.filter((a) => a.theme === 'youtube');
-  const otherNew = allArticles.filter((a) => a.theme !== 'youtube');
+  const youtubeArticles = articlesToStore.filter((a) => a.theme === 'youtube');
+  const otherNew = articlesToStore.filter((a) => a.theme !== 'youtube');
 
   // YouTube en priorité (classification complète)
   if (youtubeArticles.length > 0) {
@@ -65,7 +146,7 @@ export async function runCron(env: Env): Promise<void> {
     await classifyAndStore(env, otherNew);
   }
 
-  // 5. Nettoyer les articles trop vieux
+  // 6. Nettoyer les articles trop vieux
   const cutoff = Date.now() - ARTICLE_TTL_DAYS * 24 * 60 * 60 * 1000;
   const { meta } = await env.DB.prepare(
     'DELETE FROM articles WHERE fetched_at < ?'

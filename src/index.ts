@@ -617,7 +617,7 @@ export default {
         OPENAI_API_KEY: !!env.OPENAI_API_KEY,
         REDDIT_PROXY_URL: env.REDDIT_PROXY_URL || null,
         REDDIT_PROXY_SECRET: !!env.REDDIT_PROXY_SECRET,
-        HF_TOKEN: !!(env as Record<string, unknown>).HF_TOKEN,
+        HF_TOKEN: !!(env as unknown as Record<string, unknown>).HF_TOKEN,
         PODCASTS_R2: !!env.PODCASTS,
       };
 
