@@ -2,6 +2,7 @@ import type { Env, Source, Article } from './types';
 import { fetchRss } from './fetchers/rss';
 import { fetchReddit } from './fetchers/reddit';
 import { fetchYoutube, pickYoutubeKey } from './fetchers/youtube';
+import { fetchGrokLive } from './fetchers/grok';
 import { classifyAndStore } from './classifier';
 
 const ARTICLE_TTL_DAYS = 7;
@@ -490,6 +491,9 @@ async function fetchSource(source: Source, env: Env): Promise<Article[]> {
         ...source,
         value: `https://dev.to/feed/tag/${source.value}`,
       });
+
+    case 'grok_live':
+      return fetchGrokLive(source, env);
 
     default:
       console.warn(`[Cron] Type non géré : ${source.type}`);

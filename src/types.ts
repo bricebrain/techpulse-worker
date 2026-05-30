@@ -25,13 +25,15 @@ export interface Env {
   REDDIT_PROXY_SECRET?: string; // partagé avec la variable reddit_proxy_secret de FastAPI
   // R2 bucket pour les podcasts auto-générés (optionnel — activer R2 dans le dashboard CF d'abord)
   PODCASTS?: R2Bucket;
+  // xAI — Grok live search (actualités tech/finance en temps réel)
+  XAI_API_KEY?: string;
 }
 
 export interface Source {
   id: string;
   name: string;
   theme: string;
-  type: 'rss' | 'hackernews_rss' | 'reddit_rss' | 'devto_tag' | 'youtube_channel' | 'arxiv';
+  type: 'rss' | 'hackernews_rss' | 'reddit_rss' | 'devto_tag' | 'youtube_channel' | 'arxiv' | 'grok_live';
   value: string;
   limit_count: number;
   is_active: number;
