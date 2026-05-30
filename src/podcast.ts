@@ -141,7 +141,36 @@ async function callLLM(
   temperature: number,
   label: string,
 ): Promise<string | null> {
-  // 1. DeepSeek-V3 — quota isolé (pas utilisé par le proxy app)
+  // 1. Groq — rapide, quota élevé, quota isolé du proxy app
+  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+  if (groqKey) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: maxTokens,
+          temperature,
+          messages,
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM Groq ✓`); return text; }
+      } else if (res.status === 429) {
+        console.warn(`[${label}] Groq 429 → fallback DeepSeek`);
+      } else {
+        console.warn(`[${label}] Groq ${res.status}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] Groq exception:`, e);
+    }
+  }
+
+  // 2. DeepSeek-V3 — bon pour les longues sorties
   if (env.DEEPSEEK_API_KEY) {
     try {
       const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
@@ -169,7 +198,7 @@ async function callLLM(
     }
   }
 
-  // 2. Gemini Flash (API OpenAI-compatible de Google)
+  // 3. Gemini Flash (API OpenAI-compatible de Google)
   if (env.GEMINI_API_KEY) {
     try {
       const res = await fetch(
@@ -232,7 +261,7 @@ async function callLLM(
     }
   }
 
-  console.warn(`[${label}] Tous les LLMs ont échoué (DeepSeek+Gemini+OpenRouter)`);
+  console.warn(`[${label}] Tous les LLMs ont échoué (Groq+DeepSeek+Gemini+OpenRouter)`);
   return null;
 }
 
@@ -242,8 +271,8 @@ async function generateDailyScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  if (!env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
-    console.warn('[Podcast/daily] Aucun LLM disponible (DeepSeek/Gemini/OpenRouter)');
+  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
+    console.warn('[Podcast/daily] Aucun LLM disponible (Groq/DeepSeek/Gemini/OpenRouter)');
     return null;
   }
 
@@ -306,8 +335,8 @@ async function generateDeepDiveScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  if (!env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
-    console.warn('[Podcast/deep_dive] Aucun LLM disponible');
+  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
+    console.warn('[Podcast/deep_dive] Aucun LLM disponible (Groq/DeepSeek/Gemini/OpenRouter)');
     return null;
   }
 
