@@ -327,11 +327,11 @@ export default {
         if (!podId || isNaN(segIndex)) return err('Paramètres invalides');
         if (!env.PODCASTS) return err('R2 non configuré', 503);
 
-        // Ordre de priorité : wav (Parler-TTS) → aac → mp3 (anciens podcasts)
-        let obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.wav`);
-        let contentType = 'audio/wav';
+        // Ordre de priorité : mp3 (Edge-TTS) → aac (OpenAI fallback) → wav (legacy)
+        let obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.mp3`);
+        let contentType = 'audio/mpeg';
         if (!obj) { obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.aac`); contentType = 'audio/aac'; }
-        if (!obj) { obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.mp3`); contentType = 'audio/mpeg'; }
+        if (!obj) { obj = await env.PODCASTS.get(`podcasts/${podId}/${segIndex}.wav`); contentType = 'audio/wav'; }
         if (!obj) return err('Segment audio introuvable', 404);
 
         return new Response(obj.body, {
