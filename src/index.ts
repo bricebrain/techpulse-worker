@@ -114,6 +114,31 @@ export default {
       return json({ articles: results, theme, classified: classified ?? null, count: results.length });
     }
 
+    // ── GET /articles/search?q=...&limit=30 — recherche cross-thème ─────
+    if (method === 'GET' && path === '/articles/search') {
+      const q     = url.searchParams.get('q')?.trim() ?? '';
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? '30'), 100);
+
+      if (q.length < 2) return json({ articles: [], query: q, count: 0 });
+
+      const pattern = `%${q}%`;
+      const cutoff  = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 derniers jours
+
+      const { results } = await env.DB.prepare(
+        `SELECT hash, theme, title, source_name, url, content, published_at
+         FROM articles
+         WHERE (title LIKE ? OR content LIKE ?)
+           AND published_at > ?
+         ORDER BY published_at DESC
+         LIMIT ?`
+      ).bind(pattern, pattern, cutoff, limit).all<{
+        hash: string; theme: string; title: string; source_name: string;
+        url: string | null; content: string | null; published_at: number | null;
+      }>();
+
+      return json({ articles: results, query: q, count: results.length });
+    }
+
     // ── GET /articles/themes — liste des thèmes disponibles ──────────────
     if (method === 'GET' && path === '/articles/themes') {
       const { results } = await env.DB.prepare(
