@@ -824,6 +824,45 @@ export default {
       return json(report);
     }
 
+    // ── POST /grok/test — test rapide Grok live search (Responses API) ───
+    if (method === 'POST' && path === '/grok/test') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const report: Record<string, unknown> = { has_key: !!env.XAI_API_KEY };
+      if (!env.XAI_API_KEY) return json({ ...report, error: 'XAI_API_KEY manquant' });
+
+      const t0 = Date.now();
+      try {
+        const res = await fetch('https://api.x.ai/v1/responses', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${env.XAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'grok-3',
+            input: [{ role: 'user', content: 'Give me 2 very recent AI news headlines as JSON array: [{"title":"...","url":"https://..."}]. ONLY the JSON array.' }],
+            tools: [{ type: 'web_search' }],
+            max_output_tokens: 300,
+            temperature: 0.1,
+          }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        report.status = res.status;
+        report.ms = Date.now() - t0;
+        const body = await res.text();
+        if (res.ok) {
+          const d = JSON.parse(body) as { output?: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>; model?: string; status?: string };
+          report.model_used = d.model;
+          report.api_status = d.status;
+          const text = d.output?.find(o => o.type === 'message')?.content?.find(c => c.type === 'output_text')?.text ?? '';
+          report.reply = text.slice(0, 400);
+        } else {
+          report.error = body.slice(0, 400);
+        }
+      } catch (e) {
+        report.error = String(e);
+        report.ms = Date.now() - t0;
+      }
+      return json(report);
+    }
+
     return err('Route inconnue', 404);
   },
 };

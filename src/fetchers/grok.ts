@@ -1,11 +1,10 @@
 /**
- * Fetcher Grok Live Search — xAI API (OpenAI-compatible)
+ * Fetcher Grok Live Search — xAI Responses API
  *
- * Interroge Grok avec la recherche web en temps réel pour récupérer
- * les dernières actualités tech/finance/AI du jour.
+ * Utilise le nouveau format xAI (/v1/responses) avec web_search tool.
+ * L'ancien search_parameters est déprécié (HTTP 410).
  *
- * Coût estimé : ~1 500 tokens/appel à ~$1.25/1M input + $2.50/1M output
- * soit ~$0.002/appel → sustainable avec 3 sources × 12 runs/j (cron 2h).
+ * Doc : https://docs.x.ai/docs/guides/tools/overview
  */
 
 import type { Env, Source, Article } from '../types';
@@ -18,21 +17,40 @@ interface GrokArticle {
   published_at?: string;
 }
 
-// Modèle xAI avec live search activée
-// grok-3 = le modèle standard de xAI, supporte search_parameters
-const GROK_MODEL = 'grok-3';
+// Responses API response shape
+interface XAIResponsesOutput {
+  type: string;
+  role?: string;
+  content?: Array<{ type: string; text?: string }>;
+}
+
+interface XAIResponsesResult {
+  output?: XAIResponsesOutput[];
+  status?: string;
+}
 
 function buildPrompt(query: string, limit: number): string {
   return (
     `Search the web right now for: "${query}".\n\n` +
-    `Return exactly the ${limit} most recent news articles (last 24-48 hours) as a valid JSON array:\n` +
-    `[{"title":"...","url":"https://...","summary":"2-3 sentence summary","published_at":"2026-05-31T10:00:00Z"},...]\n\n` +
+    `Return exactly the ${limit} most recent news articles (published in the last 48 hours) as a valid JSON array:\n` +
+    `[{"title":"...","url":"https://...","summary":"2-3 sentence summary in English","published_at":"2026-05-31T10:00:00Z"},...]\n\n` +
     `Rules:\n` +
-    `- Only articles published in the last 48 hours\n` +
+    `- Only real articles published in the last 48 hours\n` +
     `- Real URLs only (no placeholders)\n` +
-    `- Summary in English, 2-3 sentences max\n` +
-    `- No markdown, no commentary, ONLY the JSON array`
+    `- No markdown, no commentary — ONLY the JSON array`
   );
+}
+
+function extractText(data: XAIResponsesResult): string {
+  // Responses API: output[0].content[0].text
+  for (const out of data.output ?? []) {
+    if (out.type === 'message') {
+      for (const block of out.content ?? []) {
+        if (block.type === 'output_text' && block.text) return block.text;
+      }
+    }
+  }
+  return '';
 }
 
 function parseArticles(text: string): GrokArticle[] {
@@ -60,53 +78,47 @@ export async function fetchGrokLive(source: Source, env: Env): Promise<Article[]
   const query = source.value;
   const limit = Math.min(source.limit_count ?? 10, 15);
 
-  console.log(`[Grok] Fetch live : "${query}" (limite ${limit})`);
+  console.log(`[Grok] Fetch live : "${query.slice(0, 60)}" (limite ${limit})`);
 
   try {
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    const res = await fetch('https://api.x.ai/v1/responses', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${env.XAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: GROK_MODEL,
-        messages: [
+        model: 'grok-3',
+        input: [
           {
-            role: 'system',
-            content:
-              'You are a tech journalist assistant. You search the web for the latest news and return structured JSON. Always return real, verified URLs.',
+            role: 'user',
+            content: buildPrompt(query, limit),
           },
-          { role: 'user', content: buildPrompt(query, limit) },
         ],
-        search_parameters: {
-          mode: 'on',           // Force live web search
-          return_citations: false,
-          max_search_results: limit + 5, // Marge pour filtrage
-        },
+        tools: [{ type: 'web_search' }],
         temperature: 0.1,
-        max_tokens: 2500,
+        max_output_tokens: 2500,
       }),
-      signal: AbortSignal.timeout(35_000),
+      signal: AbortSignal.timeout(45_000),
     });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      console.warn(`[Grok] ${source.name} → HTTP ${res.status}: ${errText.slice(0, 200)}`);
+      console.warn(`[Grok] ${source.name} → HTTP ${res.status}: ${errText.slice(0, 300)}`);
       return [];
     }
 
-    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
-    const text = data?.choices?.[0]?.message?.content ?? '';
+    const data = await res.json<XAIResponsesResult>();
+    const text = extractText(data);
 
     if (!text) {
-      console.warn(`[Grok] ${source.name} → réponse vide`);
+      console.warn(`[Grok] ${source.name} → réponse vide (status=${data.status})`);
       return [];
     }
 
     const parsed = parseArticles(text);
     if (!parsed.length) {
-      console.warn(`[Grok] ${source.name} → aucun article parsé (réponse: ${text.slice(0, 200)})`);
+      console.warn(`[Grok] ${source.name} → aucun article parsé (extrait: ${text.slice(0, 200)})`);
       return [];
     }
 
@@ -124,7 +136,7 @@ export async function fetchGrokLive(source: Source, env: Env): Promise<Article[]
       fetched_at: now,
     }));
 
-    console.log(`[Grok] ${source.name} → ${articles.length} articles récupérés`);
+    console.log(`[Grok] ${source.name} → ${articles.length} articles`);
     return articles;
   } catch (e) {
     console.warn(`[Grok] Exception ${source.name}:`, e);
