@@ -369,6 +369,30 @@ export default {
       return json({ message: 'Génération TechBrief lancée en arrière-plan' });
     }
 
+    // ── DELETE /podcasts/:id — supprimer un podcast (D1 + R2) ───────────────
+    if (method === 'DELETE' && path.startsWith('/podcasts/') && path.split('/').length === 3) {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const podId = path.split('/')[2];
+      if (!podId) return err('ID manquant');
+
+      const pod = await env.DB.prepare(
+        'SELECT id, segment_count FROM podcast_feed WHERE id = ?'
+      ).bind(podId).first<{ id: string; segment_count: number }>();
+      if (!pod) return err('Podcast introuvable', 404);
+
+      // Supprimer les segments R2 (toutes extensions)
+      if (env.PODCASTS) {
+        const exts = ['mp3', 'aac', 'wav'];
+        const keys = exts.flatMap((ext) =>
+          Array.from({ length: pod.segment_count }, (_, i) => `podcasts/${podId}/${i}.${ext}`),
+        );
+        await env.PODCASTS.delete(keys);
+      }
+
+      await env.DB.prepare('DELETE FROM podcast_feed WHERE id = ?').bind(podId).run();
+      return json({ deleted: podId });
+    }
+
     // ── POST /podcasts/generate-deep-dive — Deep Dive manuellement ─────────
     if (method === 'POST' && path === '/podcasts/generate-deep-dive') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
