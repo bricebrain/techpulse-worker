@@ -341,6 +341,34 @@ export default {
       return json({ ingested: stmts.length });
     }
 
+    // ── POST /devices/register — enregistrer token push + keywords ────────
+    if (method === 'POST' && path === '/devices/register') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const body = await req.json<{ token?: string; platform?: string; keywords?: string[] }>().catch(() => null);
+      if (!body?.token) return err('token requis');
+
+      const now = new Date().toISOString();
+      const keywords = JSON.stringify((body.keywords ?? []).map((k) => k.trim().toLowerCase()).filter(Boolean));
+
+      await env.DB.prepare(
+        `INSERT INTO devices (token, platform, keywords, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(token) DO UPDATE SET keywords = excluded.keywords, updated_at = excluded.updated_at`
+      ).bind(body.token, body.platform ?? 'unknown', keywords, now, now).run();
+
+      return json({ registered: true });
+    }
+
+    // ── DELETE /devices/:token — désenregistrer un appareil ────────────────
+    if (method === 'DELETE' && path.startsWith('/devices/')) {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const token = decodeURIComponent(path.split('/')[2] ?? '');
+      if (!token) return err('token requis');
+      await env.DB.prepare('DELETE FROM devices WHERE token = ?').bind(token).run();
+      return json({ unregistered: true });
+    }
+
     // ── POST /cron/trigger — déclencher le cron manuellement ─────────────
     if (method === 'POST' && path === '/cron/trigger') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);

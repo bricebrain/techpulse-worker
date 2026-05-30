@@ -273,11 +273,69 @@ export async function runCronFetch(env: Env): Promise<void> {
     await env.DB.batch(stmts);
   }
 
-  // 5. Nettoyage TTL
+  // 5. Notifications push pour les alertes par mots-clés
+  if (articlesToStore.length > 0) {
+    await dispatchPushAlerts(articlesToStore, env);
+  }
+
+  // 6. Nettoyage TTL
   const cutoff = Date.now() - ARTICLE_TTL_DAYS * 24 * 60 * 60 * 1000;
   const { meta } = await env.DB.prepare('DELETE FROM articles WHERE fetched_at < ?').bind(cutoff).run();
 
   console.log(`[Cron/Fetch] Nettoyage : ${meta.changes} supprimés. Terminé ✓`);
+}
+
+// ─── Dispatch push notifications ─────────────────────────────────────────────
+
+async function dispatchPushAlerts(newArticles: Article[], env: Env): Promise<void> {
+  const { results: devices } = await env.DB.prepare(
+    'SELECT token, keywords FROM devices'
+  ).all<{ token: string; keywords: string }>();
+
+  if (!devices.length) return;
+
+  interface PushMessage { to: string; title: string; body: string; data: Record<string, string>; channelId: string }
+  const messages: PushMessage[] = [];
+
+  for (const device of devices) {
+    let keywords: string[] = [];
+    try { keywords = JSON.parse(device.keywords); } catch { continue; }
+    if (!keywords.length) continue;
+
+    // Un seul article par device par run (le premier qui matche)
+    for (const article of newArticles) {
+      const haystack = `${article.title} ${article.content ?? ''}`.toLowerCase();
+      const matched = keywords.find((kw) => haystack.includes(kw));
+      if (matched) {
+        messages.push({
+          to: device.token,
+          title: `🔔 ${matched.charAt(0).toUpperCase() + matched.slice(1)}`,
+          body: article.title,
+          data: { hash: article.hash, theme: article.theme },
+          channelId: 'alerts',
+        });
+        break; // une notif max par device par cron
+      }
+    }
+  }
+
+  if (!messages.length) return;
+
+  // Expo Push API — gratuit, gère iOS (APNs) + Android (FCM) automatiquement
+  const batches = chunkArray(messages, 100);
+  for (const batch of batches) {
+    await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(batch),
+      signal: AbortSignal.timeout(10_000),
+    }).catch((e) => console.warn('[Push] Erreur envoi:', e));
+  }
+
+  console.log(`[Push] ${messages.length} notifications envoyées`);
 }
 
 /**
