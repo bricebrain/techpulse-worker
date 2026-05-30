@@ -348,8 +348,10 @@ export async function runCronEnrich(env: Env): Promise<void> {
 
   // 1. Traduction française + résumé narratif
   if (env.GEMINI_API_KEY) {
+    // LIMIT 50 = 2 appels Gemini max par run (évite les timeouts Worker)
+    // Les articles restants sont traduits lors des prochains runs (toutes les 2h)
     const { results: untranslated } = await env.DB.prepare(
-      `SELECT hash, title, content FROM articles WHERE title_fr IS NULL ORDER BY fetched_at DESC`,
+      `SELECT hash, title, content FROM articles WHERE title_fr IS NULL ORDER BY fetched_at DESC LIMIT 50`,
     ).all<{ hash: string; title: string; content: string | null }>();
 
     if (untranslated.length > 0) {

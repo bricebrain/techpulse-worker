@@ -369,11 +369,18 @@ export default {
       return json({ unregistered: true });
     }
 
-    // ── POST /cron/trigger — déclencher le cron manuellement ─────────────
+    // ── POST /cron/trigger — déclencher le cron fetch manuellement ───────
     if (method === 'POST' && path === '/cron/trigger') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
-      ctx.waitUntil(runCron(env));
-      return json({ message: 'Cron lancé en arrière-plan' });
+      ctx.waitUntil(runCronFetch(env));
+      return json({ message: 'Cron fetch lancé en arrière-plan' });
+    }
+
+    // ── POST /cron/enrich — traduction FR + classification ────────────────
+    if (method === 'POST' && path === '/cron/enrich') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      ctx.waitUntil(runCronEnrich(env));
+      return json({ message: 'Cron enrich lancé en arrière-plan' });
     }
 
     // ── GET /podcasts — liste des podcasts auto-générés ───────────────────
