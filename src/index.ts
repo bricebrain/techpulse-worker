@@ -1,5 +1,5 @@
 import type { Env, Source } from './types';
-import { runCron, fetchAndStoreSource } from './cron';
+import { runCronFetch, runCronEnrich, runCron, fetchAndStoreSource } from './cron';
 import { generateDailyPodcast, generateDeepDivePodcast } from './podcast';
 import { generateSuggestions } from './suggester';
 import type { DbSuggestion } from './suggester';
@@ -15,24 +15,37 @@ export default {
     // donc runCron tourne déjà dans une invocation parallèle.
     // On ne le relance PAS dans les invocations podcast/deep-dive
     // pour ne pas épuiser le budget avant les appels LLM/TTS.
-    const isPodcastCron = event.cron === '0 6 * * *' || event.cron === '0 6 * * 5';
-
     ctx.waitUntil(
       (async () => {
-        if (!isPodcastCron) {
-          // 0 */2 * * * (articles) et 0 7 * * * (suggestions) → fetch articles d'abord
-          await runCron(env);
+        // ── Fetch rapide (30 min) : RSS/Reddit + dédup + upsert ─────────────
+        if (event.cron === '*/30 * * * *') {
+          await runCronFetch(env);
+          return;
         }
+        // ── Enrichissement (2h) : traduction FR + classification ─────────────
+        if (event.cron === '0 */2 * * *') {
+          await runCronFetch(env);   // fetch d'abord pour avoir les derniers articles
+          await runCronEnrich(env);
+          return;
+        }
+        // ── Podcast quotidien 6h ──────────────────────────────────────────────
         if (event.cron === '0 6 * * *') {
           await generateDailyPodcast(env);
+          return;
         }
+        // ── Deep Dive vendredi 6h ─────────────────────────────────────────────
         if (event.cron === '0 6 * * 5') {
-          // Vendredi : Deep Dive (TechBrief est généré par 0 6 * * * le même jour)
           await generateDeepDivePodcast(env);
+          return;
         }
+        // ── Suggestions IA 7h ─────────────────────────────────────────────────
         if (event.cron === '0 7 * * *') {
+          await runCronFetch(env);
           await generateSuggestions(env);
+          return;
         }
+        // Fallback : cron inconnu → fetch complet
+        await runCron(env);
       })(),
     );
   },
@@ -125,18 +138,41 @@ export default {
       const cutoff  = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 derniers jours
 
       const { results } = await env.DB.prepare(
-        `SELECT hash, theme, title, source_name, url, content, published_at
+        `SELECT hash, theme, title, title_fr, source_name, url, content, summary_fr, published_at
          FROM articles
-         WHERE (title LIKE ? OR content LIKE ?)
+         WHERE (title LIKE ? OR content LIKE ? OR title_fr LIKE ?)
            AND published_at > ?
          ORDER BY published_at DESC
          LIMIT ?`
-      ).bind(pattern, pattern, cutoff, limit).all<{
-        hash: string; theme: string; title: string; source_name: string;
-        url: string | null; content: string | null; published_at: number | null;
+      ).bind(pattern, pattern, pattern, cutoff, limit).all<{
+        hash: string; theme: string; title: string; title_fr: string | null;
+        source_name: string; url: string | null; content: string | null;
+        summary_fr: string | null; published_at: number | null;
       }>();
 
       return json({ articles: results, query: q, count: results.length });
+    }
+
+    // ── GET /articles/recent?limit=15&hours=12 — breaking news cross-thème ─
+    if (method === 'GET' && path === '/articles/recent') {
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? '15'), 50);
+      const hours = Math.min(Number(url.searchParams.get('hours') ?? '12'), 48);
+      const cutoff     = Date.now() - hours * 60 * 60 * 1000;
+      const freshCutoff = Date.now() - 2 * 60 * 60 * 1000; // 2h : fenêtre avant enrichissement
+
+      // Filtre qualité :
+      //   - Article classifié (classified_theme IS NOT NULL) → vérifié comme tech/finance
+      //   - OU très récent (< 2h) et non encore classifié → pas encore passé à l'enrichissement
+      const { results } = await env.DB.prepare(
+        `SELECT hash, theme, title, title_fr, source_name, url, content, summary_fr, published_at, fetched_at
+         FROM articles
+         WHERE published_at > ?
+           AND (classified_theme IS NOT NULL OR fetched_at > ?)
+         ORDER BY published_at DESC
+         LIMIT ?`
+      ).bind(cutoff, freshCutoff, limit).all();
+
+      return json({ articles: results, hours, count: results.length });
     }
 
     // ── GET /articles/themes — liste des thèmes disponibles ──────────────

@@ -7,17 +7,18 @@ import type { Env, Article } from './types';
 
 const MODEL = '@cf/meta/llama-3.2-3b-instruct';
 
-const VALID_THEMES = ['ai', 'mobile', 'general', 'business', 'startups', 'opensource', 'productivity'] as const;
+const VALID_THEMES = ['ai', 'mobile', 'general', 'business', 'startups', 'opensource', 'productivity', 'finance'] as const;
 type Theme = typeof VALID_THEMES[number];
 
 const THEME_DESCRIPTIONS: Record<Theme, string> = {
   ai:           'artificial intelligence, machine learning, LLMs, neural networks, GPT, ChatGPT, deep learning',
   mobile:       'mobile development, iOS, Android, React Native, Expo, Swift, Kotlin, Flutter',
   general:      'web development, programming, software engineering, DevOps, cloud, APIs, GitHub',
-  business:     'business strategy, finance, markets, economy, venture capital, investment, tech industry news',
+  business:     'business strategy, venture capital, investment, tech industry news, mergers, acquisitions',
   startups:     'startups, product launches, entrepreneurship, funding rounds, tech companies',
   opensource:   'open source, Linux, developer tools, libraries, frameworks, community projects',
   productivity: 'productivity, time management, automation, workflows, tools, personal efficiency',
+  finance:      'stock markets, financial news, economy, trading, crypto, interest rates, earnings reports, IPO',
 };
 
 function buildPrompt(title: string, content: string): string {

@@ -6,9 +6,9 @@ import { classifyAndStore } from './classifier';
 
 const ARTICLE_TTL_DAYS = 7;
 
-// ─── Déduplication par similarité de titre ───────────────────────────────────
-// Jaccard sur les mots significatifs : si ≥ 45 % des mots se recoupent
-// → même sujet traité par une autre source → on ignore.
+// ─── Déduplication sémantique (Workers AI) + fallback Jaccard ────────────────
+// Embeddings @cf/baai/bge-base-en-v1.5 → cosine ≥ 0.88 = même histoire.
+// Fallback sur Jaccard (mots significatifs ≥ 45 %) si l'API AI échoue.
 
 const STOPWORDS = new Set([
   // Anglais
@@ -48,9 +48,8 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 }
 
 /**
- * Filtre les doublons near-sémantiques d'un lot d'articles.
- * `existingTitles` = titres déjà en base (dernières 24h).
- * Retourne les articles uniques + le nombre de doublons éliminés.
+ * Fallback Jaccard : filtre les doublons par overlap de mots significatifs.
+ * Utilisé si l'API embeddings est indisponible.
  */
 function deduplicateArticles(
   articles: Article[],
@@ -65,7 +64,7 @@ function deduplicateArticles(
     const isDup = seen.some((s) => jaccard(words, s) >= DEDUP_THRESHOLD);
     if (isDup) {
       skipped++;
-      console.log(`[Dédup] Ignoré (doublon) : "${article.title.slice(0, 70)}"`);
+      console.log(`[Dédup/Jaccard] Ignoré : "${article.title.slice(0, 70)}"`);
     } else {
       unique.push(article);
       seen.push(words);
@@ -75,85 +74,267 @@ function deduplicateArticles(
   return { unique, skipped };
 }
 
-export async function runCron(env: Env): Promise<void> {
-  console.log('[Cron] Démarrage du fetch de veille…');
+// ─── Cosine similarity ────────────────────────────────────────────────────────
 
-  // 1. Charger les sources actives
+function cosine(a: number[], b: number[]): number {
+  let dot = 0, ma = 0, mb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    ma  += a[i]! * a[i]!;
+    mb  += b[i]! * b[i]!;
+  }
+  const denom = Math.sqrt(ma) * Math.sqrt(mb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+async function getEmbeddingsBatch(texts: string[], env: Env): Promise<number[][] | null> {
+  try {
+    const result = await (env.AI.run as Function)('@cf/baai/bge-base-en-v1.5', { text: texts });
+    return (result as { data: number[][] }).data;
+  } catch (e) {
+    console.warn('[Dédup] Erreur embeddings batch:', e);
+    return null;
+  }
+}
+
+/**
+ * Déduplication sémantique via Workers AI embeddings.
+ * Cosine ≥ 0.88 = même histoire couverte par plusieurs sources → ignoré.
+ * Fallback automatique sur Jaccard si l'API AI échoue.
+ */
+async function deduplicateWithEmbeddings(
+  newArticles: Article[],
+  existingTitles: string[],
+  env: Env,
+): Promise<{ unique: Article[]; skipped: number }> {
+  if (newArticles.length === 0) return { unique: [], skipped: 0 };
+
+  const THRESHOLD = 0.88;
+  const BATCH_SIZE = 100;
+  const MAX_EXISTING = 150; // cap pour ne pas exploser les coûts
+
+  const recentExisting = existingTitles.slice(0, MAX_EXISTING);
+  const newTitles = newArticles.map((a) => a.title);
+
+  // Embeddings des titres existants (par batches)
+  const existingEmbs: number[][] = [];
+  for (let i = 0; i < recentExisting.length; i += BATCH_SIZE) {
+    const batch = recentExisting.slice(i, i + BATCH_SIZE);
+    const embs = await getEmbeddingsBatch(batch, env);
+    if (embs === null) {
+      console.warn('[Dédup] Fallback Jaccard (erreur embeddings existants)');
+      return deduplicateArticles(newArticles, existingTitles);
+    }
+    existingEmbs.push(...embs);
+  }
+
+  // Embeddings des nouveaux articles (par batches)
+  const newEmbs: number[][] = [];
+  for (let i = 0; i < newTitles.length; i += BATCH_SIZE) {
+    const batch = newTitles.slice(i, i + BATCH_SIZE);
+    const embs = await getEmbeddingsBatch(batch, env);
+    if (embs === null) {
+      console.warn('[Dédup] Fallback Jaccard (erreur embeddings nouveaux)');
+      return deduplicateArticles(newArticles, existingTitles);
+    }
+    newEmbs.push(...embs);
+  }
+
+  // Comparaison : chaque nouvel article vs existants + nouveaux déjà acceptés
+  const keptEmbs: number[][] = [...existingEmbs];
+  const unique: Article[] = [];
+  let skipped = 0;
+
+  for (let i = 0; i < newArticles.length; i++) {
+    const emb = newEmbs[i]!;
+    const isDup = keptEmbs.some((e) => cosine(emb, e) >= THRESHOLD);
+    if (isDup) {
+      skipped++;
+      console.log(`[Dédup/AI] Doublon sémantique : "${newArticles[i]!.title.slice(0, 70)}"`);
+    } else {
+      unique.push(newArticles[i]!);
+      keptEmbs.push(emb);
+    }
+  }
+
+  return { unique, skipped };
+}
+
+// ─── Traduction française + résumé narratif (Gemini Flash batch) ─────────────
+
+interface FrenchContent { title_fr: string; summary_fr: string }
+
+async function generateFrenchBatch(
+  articles: { hash: string; title: string; content: string | null }[],
+  env: Env,
+): Promise<Map<string, FrenchContent>> {
+  const results = new Map<string, FrenchContent>();
+  if (!articles.length || !env.GEMINI_API_KEY) return results;
+
+  const input = articles.map((a) => ({
+    hash: a.hash,
+    title: a.title,
+    excerpt: (a.content ?? '').slice(0, 200),
+  }));
+
+  const prompt = `Tu es journaliste tech francophone. Pour chaque article JSON ci-dessous, génère :
+- "title_fr" : titre traduit en français, concis et fidèle
+- "summary_fr" : exactement 3 phrases narratives en français, style commentateur radio matinal, sans bullet, sans markdown, sans guillemets autour des phrases
+
+Articles : ${JSON.stringify(input)}
+
+Réponds UNIQUEMENT avec un tableau JSON valide (aucun texte avant ou après) :
+[{"hash":"...","title_fr":"...","summary_fr":"..."},...]`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25_000);
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
+        }),
+        signal: controller.signal,
+      },
+    ).finally(() => clearTimeout(timer));
+
+    if (!res.ok) { console.warn(`[FR] Gemini ${res.status}`); return results; }
+
+    const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) { console.warn('[FR] Réponse non parsable:', text.slice(0, 200)); return results; }
+
+    const parsed = JSON.parse(match[0]) as { hash: string; title_fr?: string; summary_fr?: string }[];
+    for (const item of parsed) {
+      if (item.hash && item.title_fr && item.summary_fr) {
+        results.set(item.hash, { title_fr: item.title_fr, summary_fr: item.summary_fr });
+      }
+    }
+    console.log(`[FR] ${results.size}/${articles.length} articles traduits`);
+  } catch (e) {
+    console.warn('[FR] Erreur batch:', e);
+  }
+  return results;
+}
+
+/**
+ * Cron rapide — toutes les 30 min.
+ * Fetch + dédup sémantique + upsert D1 + nettoyage TTL.
+ * Pas de Gemini, pas de classification → coût quasi nul.
+ */
+export async function runCronFetch(env: Env): Promise<void> {
+  console.log('[Cron/Fetch] Démarrage…');
+
+  // 1. Sources actives
   const { results: sources } = await env.DB.prepare(
     'SELECT * FROM sources WHERE is_active = 1'
   ).all<Source>();
 
-  console.log(`[Cron] ${sources.length} sources actives`);
-
-  // 2. Fetch en parallèle (max 10 à la fois pour éviter les timeouts)
+  // 2. Fetch parallèle par chunks de 10
   const chunks = chunkArray(sources, 10);
   const allArticles: Article[] = [];
-
   for (const chunk of chunks) {
-    const results = await Promise.allSettled(
-      chunk.map((source) => fetchSource(source, env))
-    );
+    const results = await Promise.allSettled(chunk.map((s) => fetchSource(s, env)));
     for (const r of results) {
       if (r.status === 'fulfilled') allArticles.push(...r.value);
-      else console.warn('[Cron] Source échouée:', r.reason);
+      else console.warn('[Cron/Fetch] Source échouée:', r.reason);
     }
   }
+  console.log(`[Cron/Fetch] ${allArticles.length} articles récupérés`);
 
-  console.log(`[Cron] ${allArticles.length} articles récupérés`);
-
-  // 3. Déduplication : on compare les titres avec les articles des 24 dernières heures
+  // 3. Déduplication sémantique (Workers AI — gratuit)
   const dedupCutoff = Date.now() - DEDUP_WINDOW_MS;
   const { results: recentTitles } = await env.DB.prepare(
-    'SELECT title FROM articles WHERE fetched_at > ?'
+    'SELECT title FROM articles WHERE fetched_at > ? ORDER BY fetched_at DESC LIMIT 150'
   ).bind(dedupCutoff).all<{ title: string }>();
 
-  const { unique: articlesToStore, skipped } = deduplicateArticles(
+  const { unique: articlesToStore, skipped } = await deduplicateWithEmbeddings(
     allArticles,
     recentTitles.map((r) => r.title),
+    env,
   );
-  console.log(`[Cron] Dédup : ${allArticles.length} → ${articlesToStore.length} articles (${skipped} doublons éliminés)`);
+  console.log(`[Cron/Fetch] Dédup : ${allArticles.length} → ${articlesToStore.length} (${skipped} doublons)`);
 
-  // 4. Upsert dans D1 par batch de 50
+  // 4. Upsert D1
   const articleChunks = chunkArray(articlesToStore, 50);
   for (const batch of articleChunks) {
     const stmts = batch.map((a) =>
       env.DB.prepare(
         `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(hash) DO UPDATE SET
-           fetched_at = excluded.fetched_at,
-           content    = excluded.content`
+         ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at, content = excluded.content`
       ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at)
     );
     await env.DB.batch(stmts);
   }
 
-  // 5. Classification Workers AI
-  // - YouTube : tous les articles (thème source = 'youtube', contenu varié)
-  // - Autres  : seulement les nouveaux articles sans classified_theme
-  const youtubeArticles = articlesToStore.filter((a) => a.theme === 'youtube');
-  const otherNew = articlesToStore.filter((a) => a.theme !== 'youtube');
-
-  // YouTube en priorité (classification complète)
-  if (youtubeArticles.length > 0) {
-    console.log(`[Cron] Classification YouTube : ${youtubeArticles.length} articles`);
-    await classifyAndStore(env, youtubeArticles);
-  }
-
-  // Autres articles : on classifie pour vérification croisée (utile pour détection hors-thème)
-  if (otherNew.length > 0) {
-    console.log(`[Cron] Classification autres sources : ${otherNew.length} articles`);
-    await classifyAndStore(env, otherNew);
-  }
-
-  // 6. Nettoyer les articles trop vieux
+  // 5. Nettoyage TTL
   const cutoff = Date.now() - ARTICLE_TTL_DAYS * 24 * 60 * 60 * 1000;
-  const { meta } = await env.DB.prepare(
-    'DELETE FROM articles WHERE fetched_at < ?'
-  ).bind(cutoff).run();
+  const { meta } = await env.DB.prepare('DELETE FROM articles WHERE fetched_at < ?').bind(cutoff).run();
 
-  console.log(`[Cron] Nettoyage : ${meta.changes} articles supprimés`);
-  console.log('[Cron] Terminé ✓');
+  console.log(`[Cron/Fetch] Nettoyage : ${meta.changes} supprimés. Terminé ✓`);
+}
+
+/**
+ * Cron enrichissement — toutes les 2h.
+ * Traduction FR (Gemini Flash) + classification (Workers AI).
+ * Les opérations coûteuses sont ici, pas dans le fetch rapide.
+ */
+export async function runCronEnrich(env: Env): Promise<void> {
+  console.log('[Cron/Enrich] Démarrage…');
+
+  // 1. Traduction française + résumé narratif
+  if (env.GEMINI_API_KEY) {
+    const { results: untranslated } = await env.DB.prepare(
+      `SELECT hash, title, content FROM articles WHERE title_fr IS NULL ORDER BY fetched_at DESC`,
+    ).all<{ hash: string; title: string; content: string | null }>();
+
+    if (untranslated.length > 0) {
+      console.log(`[Cron/Enrich] Traduction FR : ${untranslated.length} articles`);
+      const FR_BATCH = 25;
+      let totalUpdated = 0;
+      for (let i = 0; i < untranslated.length; i += FR_BATCH) {
+        const frMap = await generateFrenchBatch(untranslated.slice(i, i + FR_BATCH), env);
+        if (frMap.size > 0) {
+          const stmts = Array.from(frMap.entries()).map(([hash, fr]) =>
+            env.DB.prepare('UPDATE articles SET title_fr = ?, summary_fr = ? WHERE hash = ?')
+              .bind(fr.title_fr, fr.summary_fr, hash),
+          );
+          await env.DB.batch(stmts);
+          totalUpdated += frMap.size;
+        }
+      }
+      console.log(`[Cron/Enrich] ${totalUpdated}/${untranslated.length} traduits (FR)`);
+    }
+  }
+
+  // 2. Classification Workers AI (articles récents sans classified_theme)
+  const recent = Date.now() - 4 * 60 * 60 * 1000; // fenêtre 4h
+  const { results: toClassify } = await env.DB.prepare(
+    `SELECT hash, theme, title, source_name, url, content, published_at, fetched_at
+     FROM articles WHERE classified_theme IS NULL AND fetched_at > ?`
+  ).bind(recent).all<Article>();
+
+  if (toClassify.length > 0) {
+    console.log(`[Cron/Enrich] Classification : ${toClassify.length} articles`);
+    const youtube = toClassify.filter((a) => a.theme === 'youtube');
+    const others  = toClassify.filter((a) => a.theme !== 'youtube');
+    if (youtube.length > 0) await classifyAndStore(env, youtube);
+    if (others.length  > 0) await classifyAndStore(env, others);
+  }
+
+  console.log('[Cron/Enrich] Terminé ✓');
+}
+
+/** @deprecated Utiliser runCronFetch + runCronEnrich séparément */
+export async function runCron(env: Env): Promise<void> {
+  await runCronFetch(env);
+  await runCronEnrich(env);
 }
 
 /**
