@@ -141,7 +141,37 @@ async function callLLM(
   temperature: number,
   label: string,
 ): Promise<string | null> {
-  // 1. Groq — rapide, quota élevé, quota isolé du proxy app
+  // 1. xAI Grok (grok-4.3) — puissant, parfait pour les scripts longs
+  // Utilise /v1/chat/completions (API OpenAI-compatible, pas Responses API)
+  if (env.XAI_API_KEY) {
+    try {
+      const res = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.XAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'grok-4.3',
+          max_tokens: maxTokens,
+          temperature,
+          messages,
+        }),
+        signal: AbortSignal.timeout(90_000), // scripts longs → timeout généreux
+      });
+      if (res.ok) {
+        const d = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+        const text = d?.choices?.[0]?.message?.content ?? '';
+        if (text) { console.log(`[${label}] LLM xAI Grok-4.3 ✓`); return text; }
+      } else if (res.status === 429) {
+        console.warn(`[${label}] xAI Grok 429 → fallback Groq`);
+      } else {
+        const errTxt = await res.text().catch(() => '');
+        console.warn(`[${label}] xAI Grok ${res.status}: ${errTxt.slice(0, 200)}`);
+      }
+    } catch (e) {
+      console.warn(`[${label}] xAI Grok exception:`, e);
+    }
+  }
+
+  // 2. Groq — rapide, quota élevé, quota isolé du proxy app
   const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
   if (groqKey) {
     try {
@@ -411,7 +441,7 @@ async function synthesizeViaFastApi(
         provider: 'edge_tts',
         response_format: 'mp3',
       }),
-      signal: AbortSignal.timeout(90_000), // Parler-TTS peut prendre 20-60s (cold start HF)
+      signal: AbortSignal.timeout(150_000), // 150s : warm-up Render free tier (60-120s cold start)
     });
 
     if (!res.ok) {
@@ -578,6 +608,16 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
   }
   console.log(`[Podcast] TTS providers disponibles : ${[hasFastApi && 'Parler-HF', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
 
+  // Lancer le warm-up Render en parallèle (free tier dort après 15 min d'inactivité,
+  // cold start = 60-120s). On pinge pendant que le LLM génère le script (~10-30s)
+  // pour que le serveur soit chaud quand le TTS commence.
+  if (hasFastApi) {
+    const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
+    fetch(`${warmupUrl}/`, { signal: AbortSignal.timeout(120_000) })
+      .then(() => console.log('[Podcast] FastAPI warm-up ✓'))
+      .catch(() => console.warn('[Podcast] FastAPI warm-up timeout — TTS utilisera le fallback OpenAI'));
+  }
+
   const articles = await fetchTopArticles(env, 20, 24);
   if (articles.length < 3) {
     console.log(`[Podcast] Seulement ${articles.length} articles frais — TechBrief annulé`);
@@ -613,6 +653,14 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
   if (!hasFastApi && !hasOpenAI) {
     console.warn('[Podcast] Aucun provider TTS disponible — abandon');
     return;
+  }
+
+  // Warm-up Render en parallèle (même logique que TechBrief)
+  if (hasFastApi) {
+    const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
+    fetch(`${warmupUrl}/`, { signal: AbortSignal.timeout(120_000) })
+      .then(() => console.log('[Podcast/deep_dive] FastAPI warm-up ✓'))
+      .catch(() => {});
   }
 
   // Articles de la semaine pour choisir le sujet le plus riche

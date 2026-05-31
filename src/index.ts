@@ -742,8 +742,8 @@ export default {
             body: JSON.stringify({
               text: 'Bonjour, test audio.',
               voice: 'host',
-              provider: 'parler_hf',
-              response_format: 'wav',
+              provider: 'edge_tts',
+              response_format: 'mp3',
             }),
             signal: AbortSignal.timeout(60_000),
           });
