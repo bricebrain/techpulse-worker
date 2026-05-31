@@ -894,6 +894,46 @@ export default {
       return json(report);
     }
 
+    // ── POST /grok/llm-test — test grok-4.3 chat completions (même API que podcast) ──
+    if (method === 'POST' && path === '/grok/llm-test') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const report: Record<string, unknown> = { has_key: !!env.XAI_API_KEY, model: 'grok-4.3' };
+      if (!env.XAI_API_KEY) return json({ ...report, error: 'XAI_API_KEY manquant' });
+
+      const t0 = Date.now();
+      try {
+        const res = await fetch('https://api.x.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${env.XAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'grok-4.3',
+            max_tokens: 80,
+            temperature: 0.5,
+            messages: [
+              { role: 'system', content: 'Tu es un assistant concis. Réponds en JSON uniquement.' },
+              { role: 'user', content: 'Donne une actu tech fictive : {"title":"...","summary":"..."}' },
+            ],
+          }),
+          signal: AbortSignal.timeout(60_000),
+        });
+        report.status = res.status;
+        report.ms = Date.now() - t0;
+        const body = await res.text();
+        if (res.ok) {
+          const d = JSON.parse(body) as { choices?: { message?: { content?: string } }[]; model?: string; usage?: unknown };
+          report.model_used = d.model;
+          report.usage = d.usage;
+          report.reply = d?.choices?.[0]?.message?.content?.slice(0, 300) ?? '';
+        } else {
+          report.error = body.slice(0, 500);
+        }
+      } catch (e) {
+        report.error = String(e);
+        report.ms = Date.now() - t0;
+      }
+      return json(report);
+    }
+
     return err('Route inconnue', 404);
   },
 };

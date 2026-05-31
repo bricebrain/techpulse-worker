@@ -149,7 +149,7 @@ async function callLLM(
         method: 'POST',
         headers: { Authorization: `Bearer ${env.XAI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'grok-4.3',
+          model: 'grok-4.20-0309-non-reasoning', // non-reasoning : rapide pour les longs scripts JSON
           max_tokens: maxTokens,
           temperature,
           messages,
@@ -608,14 +608,19 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
   }
   console.log(`[Podcast] TTS providers disponibles : ${[hasFastApi && 'Parler-HF', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
 
-  // Lancer le warm-up Render en parallèle (free tier dort après 15 min d'inactivité,
-  // cold start = 60-120s). On pinge pendant que le LLM génère le script (~10-30s)
-  // pour que le serveur soit chaud quand le TTS commence.
+  // Warm-up Render en parallèle : on pinge le vrai endpoint TTS (pas juste "/")
+  // pour forcer le chargement complet d'edge-tts avant les segments réels.
+  // Free tier cold start = 60-120s ; le LLM prend ~20-40s → on part en même temps.
   if (hasFastApi) {
     const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
-    fetch(`${warmupUrl}/`, { signal: AbortSignal.timeout(120_000) })
-      .then(() => console.log('[Podcast] FastAPI warm-up ✓'))
-      .catch(() => console.warn('[Podcast] FastAPI warm-up timeout — TTS utilisera le fallback OpenAI'));
+    fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
+      signal: AbortSignal.timeout(120_000),
+    })
+      .then((r) => console.log(`[Podcast] FastAPI warm-up TTS ✓ (${r.status})`))
+      .catch(() => console.warn('[Podcast] FastAPI warm-up TTS timeout — fallback OpenAI probable'));
   }
 
   const articles = await fetchTopArticles(env, 20, 24);
@@ -655,12 +660,17 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
     return;
   }
 
-  // Warm-up Render en parallèle (même logique que TechBrief)
+  // Warm-up Render : pinger le vrai endpoint TTS pour forcer le chargement d'edge-tts
   if (hasFastApi) {
     const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
-    fetch(`${warmupUrl}/`, { signal: AbortSignal.timeout(120_000) })
-      .then(() => console.log('[Podcast/deep_dive] FastAPI warm-up ✓'))
-      .catch(() => {});
+    fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
+      signal: AbortSignal.timeout(120_000),
+    })
+      .then((r) => console.log(`[Podcast/deep_dive] FastAPI warm-up TTS ✓ (${r.status})`))
+      .catch(() => console.warn('[Podcast/deep_dive] FastAPI warm-up TTS timeout'));
   }
 
   // Articles de la semaine pour choisir le sujet le plus riche
