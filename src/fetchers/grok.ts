@@ -88,7 +88,7 @@ export async function fetchGrokLive(source: Source, env: Env): Promise<Article[]
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'grok-3',
+        model: 'grok-4',
         input: [
           {
             role: 'user',
