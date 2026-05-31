@@ -594,6 +594,112 @@ export default {
       return json({ message: 'Analyse de suggestions lancée en arrière-plan' });
     }
 
+    // ── GET /analyses?hashes=h1,h2,... — batch fetch analyses depuis D1 ───────
+    // Utilisé par l'app avant de lancer l'IA : "est-ce que cette analyse existe déjà ?"
+    if (method === 'GET' && path === '/analyses') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const rawHashes = url.searchParams.get('hashes') ?? '';
+      const hashes = rawHashes.split(',').map((h) => h.trim()).filter(Boolean).slice(0, 50);
+      if (!hashes.length) return json({ analyses: [] });
+
+      const placeholders = hashes.map(() => '?').join(',');
+      const { results } = await env.DB.prepare(
+        `SELECT article_hash, title, source_name, url, analysis_en, summary_fr, impact_fr,
+                analysis_status, analysis_data, model_used, updated_at
+         FROM article_analyses WHERE article_hash IN (${placeholders})`
+      ).bind(...hashes).all<{
+        article_hash: string; title: string; source_name: string | null; url: string | null;
+        analysis_en: string | null; summary_fr: string | null; impact_fr: string | null;
+        analysis_status: string; analysis_data: string | null; model_used: string | null;
+        updated_at: number;
+      }>();
+
+      return json({ analyses: results, count: results.length });
+    }
+
+    // ── POST /analyses — upsert une ou plusieurs analyses ────────────────────
+    // L'app pousse l'analyse après génération IA locale.
+    if (method === 'POST' && path === '/analyses') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      interface AnalysisInput {
+        article_hash: string;
+        title: string;
+        source_name?: string | null;
+        url?: string | null;
+        analysis_en?: string | null;
+        summary_fr?: string | null;
+        impact_fr?: string | null;
+        analysis_status?: string;
+        analysis_data?: string | null;
+        model_used?: string | null;
+      }
+
+      const body = await req.json<{ analyses?: AnalysisInput[]; analysis?: AnalysisInput }>().catch(() => null);
+      const list: AnalysisInput[] = body?.analyses ?? (body?.analysis ? [body.analysis] : []);
+
+      const valid = list.filter((a) => a.article_hash && a.title);
+      if (!valid.length) return json({ upserted: 0 });
+
+      const now = Date.now();
+      const stmts = valid.map((a) =>
+        env.DB.prepare(
+          `INSERT INTO article_analyses
+             (article_hash, title, source_name, url, analysis_en, summary_fr, impact_fr,
+              analysis_status, analysis_data, model_used, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(article_hash) DO UPDATE SET
+             analysis_en     = COALESCE(excluded.analysis_en, analysis_en),
+             summary_fr      = COALESCE(excluded.summary_fr, summary_fr),
+             impact_fr       = COALESCE(excluded.impact_fr, impact_fr),
+             analysis_status = excluded.analysis_status,
+             analysis_data   = COALESCE(excluded.analysis_data, analysis_data),
+             model_used      = COALESCE(excluded.model_used, model_used),
+             updated_at      = excluded.updated_at`
+        ).bind(
+          a.article_hash, a.title, a.source_name ?? null, a.url ?? null,
+          a.analysis_en ?? null, a.summary_fr ?? null, a.impact_fr ?? null,
+          a.analysis_status ?? 'done', a.analysis_data ?? null, a.model_used ?? null,
+          now, now,
+        )
+      );
+
+      await env.DB.batch(stmts);
+      return json({ upserted: valid.length });
+    }
+
+    // ── GET /analyses/radar — Tech Radar aggrégé sur les analyses D1 ─────────
+    // Retourne la distribution des signaux, les technos citées, les scores moyens.
+    if (method === 'GET' && path === '/analyses/radar') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000; // 90 jours
+
+      const [signals, total] = await Promise.all([
+        env.DB.prepare(
+          `SELECT
+             json_extract(analysis_data, '$.actionSignal') as signal,
+             COUNT(*) as n,
+             ROUND(AVG(CAST(json_extract(analysis_data, '$.impactScore') AS REAL)), 1) as avg_impact
+           FROM article_analyses
+           WHERE analysis_data IS NOT NULL AND updated_at > ?
+           GROUP BY signal
+           ORDER BY n DESC`
+        ).bind(cutoff).all<{ signal: string | null; n: number; avg_impact: number | null }>(),
+
+        env.DB.prepare(
+          `SELECT COUNT(*) as n FROM article_analyses WHERE analysis_data IS NOT NULL AND updated_at > ?`
+        ).bind(cutoff).first<{ n: number }>(),
+      ]);
+
+      return json({
+        total: total?.n ?? 0,
+        period_days: 90,
+        signals: signals.results,
+      });
+    }
+
     // ── POST /podcasts/debug2 — trace étape par étape de la génération ──────
     if (method === 'POST' && path === '/podcasts/debug2') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
