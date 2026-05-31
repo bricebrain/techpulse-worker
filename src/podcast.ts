@@ -586,6 +586,32 @@ async function cleanupOldPodcasts(env: Env): Promise<void> {
   }
 }
 
+// ─── Push notification ────────────────────────────────────────────────────────
+
+async function notifyPodcastReady(env: Env, title: string, format: 'daily' | 'deep_dive'): Promise<void> {
+  if (!env.DB) return;
+  const { results: devices } = await env.DB.prepare('SELECT token FROM devices').all<{ token: string }>();
+  if (!devices.length) return;
+
+  const isDeepDive = format === 'deep_dive';
+  const messages = devices.map((d) => ({
+    to: d.token,
+    title: isDeepDive ? '🔬 Deep Dive disponible' : '🎙 TechBrief du jour',
+    body: title,
+    data: { type: 'podcast', format },
+    channelId: 'alerts',
+  }));
+
+  await fetch('https://exp.host/--/api/v2/push/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify(messages),
+    signal: AbortSignal.timeout(10_000),
+  }).catch((e) => console.warn('[Push/Podcast] Erreur:', e));
+
+  console.log(`[Push/Podcast] ${messages.length} notification(s) envoyée(s) : "${title}"`);
+}
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 /**
@@ -638,6 +664,7 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
   console.log(`[Podcast/daily] Script OK : "${script.title}" (${script.segments.length} segments)`);
 
   await uploadAndSave(script, 'daily', env);
+  await notifyPodcastReady(env, script.title, 'daily');
   await cleanupOldPodcasts(env);
 }
 
@@ -689,5 +716,6 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
   console.log(`[Podcast/deep_dive] Script OK : "${script.title}" (${script.segments.length} segments)`);
 
   await uploadAndSave(script, 'deep_dive', env);
+  await notifyPodcastReady(env, script.title, 'deep_dive');
   // Le cleanup est fait par generateDailyPodcast — pas besoin de le doubler le vendredi
 }
