@@ -824,6 +824,37 @@ export default {
       return json(report);
     }
 
+    // ── POST /grok/fetch — teste + insère toutes les sources grok_live ────
+    if (method === 'POST' && path === '/grok/fetch') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      const { fetchGrokLive } = await import('./fetchers/grok');
+
+      const { results: grokSources } = await env.DB.prepare(
+        `SELECT * FROM sources WHERE type = 'grok_live' AND is_active = 1`,
+      ).all<import('./types').Source>();
+
+      const report: Array<{ source: string; fetched: number; articles: string[] }> = [];
+      const allArticles: import('./types').Article[] = [];
+
+      for (const src of grokSources) {
+        const articles = await fetchGrokLive(src, env);
+        report.push({ source: src.name, fetched: articles.length, articles: articles.map((a) => a.title) });
+        allArticles.push(...articles);
+      }
+
+      if (allArticles.length > 0) {
+        const stmts = allArticles.map((a) =>
+          env.DB.prepare(
+            `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at`,
+          ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at),
+        );
+        await env.DB.batch(stmts);
+      }
+      return json({ total: allArticles.length, sources: report });
+    }
+
     // ── POST /grok/test — test rapide Grok live search (Responses API) ───
     if (method === 'POST' && path === '/grok/test') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
