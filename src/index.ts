@@ -670,13 +670,14 @@ export default {
     }
 
     // ── GET /analyses/radar — Tech Radar aggrégé sur les analyses D1 ─────────
-    // Retourne la distribution des signaux, les technos citées, les scores moyens.
+    // Retourne signaux, technos, horizons, et exemples récents par signal.
     if (method === 'GET' && path === '/analyses/radar') {
       if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
 
       const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000; // 90 jours
 
-      const [signals, total] = await Promise.all([
+      const [signals, rawAnalyses, total] = await Promise.all([
+        // Distribution des signaux avec avg impact et horizon dominant
         env.DB.prepare(
           `SELECT
              json_extract(analysis_data, '$.actionSignal') as signal,
@@ -688,15 +689,69 @@ export default {
            ORDER BY n DESC`
         ).bind(cutoff).all<{ signal: string | null; n: number; avg_impact: number | null }>(),
 
+        // Récupère les analysis_data bruts pour agréger les technos en JS
+        env.DB.prepare(
+          `SELECT title, analysis_data FROM article_analyses
+           WHERE analysis_data IS NOT NULL AND updated_at > ?
+           ORDER BY updated_at DESC LIMIT 100`
+        ).bind(cutoff).all<{ title: string; analysis_data: string }>(),
+
         env.DB.prepare(
           `SELECT COUNT(*) as n FROM article_analyses WHERE analysis_data IS NOT NULL AND updated_at > ?`
         ).bind(cutoff).first<{ n: number }>(),
       ]);
 
+      // Agrégation JS : technos par signal + top technos globales + exemples par signal
+      const techGlobal: Record<string, number> = {};
+      const techBySignal: Record<string, Record<string, number>> = {};
+      const examplesBySignal: Record<string, string[]> = {};
+
+      for (const row of rawAnalyses.results) {
+        try {
+          const d = JSON.parse(row.analysis_data) as {
+            actionSignal?: string;
+            keyTechnologies?: string[];
+            impactScore?: number;
+          };
+          const sig = d.actionSignal ?? 'watch';
+
+          // Technos
+          for (const tech of d.keyTechnologies ?? []) {
+            techGlobal[tech] = (techGlobal[tech] ?? 0) + 1;
+            if (!techBySignal[sig]) techBySignal[sig] = {};
+            techBySignal[sig][tech] = (techBySignal[sig][tech] ?? 0) + 1;
+          }
+
+          // Exemple (3 titres max par signal)
+          if (!examplesBySignal[sig]) examplesBySignal[sig] = [];
+          if (examplesBySignal[sig].length < 3) {
+            examplesBySignal[sig].push(row.title);
+          }
+        } catch { /* JSON corrompu, on ignore */ }
+      }
+
+      // Top technos globales (max 20)
+      const topTechnologies = Object.entries(techGlobal)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 20)
+        .map(([tech, n]) => ({ tech, n }));
+
+      // Top technos par signal (max 5)
+      const topTechBySignal: Record<string, { tech: string; n: number }[]> = {};
+      for (const [sig, counts] of Object.entries(techBySignal)) {
+        topTechBySignal[sig] = Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([tech, n]) => ({ tech, n }));
+      }
+
       return json({
         total: total?.n ?? 0,
         period_days: 90,
         signals: signals.results,
+        topTechnologies,
+        topTechBySignal,
+        examplesBySignal,
       });
     }
 
