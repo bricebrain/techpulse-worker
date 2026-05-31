@@ -7,7 +7,7 @@
 import type { Env } from './types';
 import { err } from './utils';
 
-type ProxyTarget = 'openai' | 'openrouter' | 'gemini' | 'groq' | 'deepseek';
+type ProxyTarget = 'openai' | 'openrouter' | 'gemini' | 'groq' | 'deepseek' | 'xai';
 
 const TARGET_URLS: Record<ProxyTarget, string> = {
   openai:      'https://api.openai.com',
@@ -15,6 +15,7 @@ const TARGET_URLS: Record<ProxyTarget, string> = {
   gemini:      'https://generativelanguage.googleapis.com',
   groq:        'https://api.groq.com',
   deepseek:    'https://api.deepseek.com',
+  xai:         'https://api.x.ai',
 };
 
 function getApiKey(target: ProxyTarget, env: Env): string | undefined {
@@ -22,8 +23,9 @@ function getApiKey(target: ProxyTarget, env: Env): string | undefined {
     case 'openai':     return env.OPENAI_API_KEY;
     case 'openrouter': return env.OPENROUTER_API_KEY;
     case 'gemini':     return env.GEMINI_API_KEY;
-    case 'groq':       return env.GROQ_TTS_KEY_1 ?? env.GROQ_TTS_KEY_2;
+    case 'groq':       return env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2 ?? env.GROQ_TTS_KEY_1 ?? env.GROQ_TTS_KEY_2;
     case 'deepseek':   return env.DEEPSEEK_API_KEY;
+    case 'xai':        return env.XAI_API_KEY;
   }
 }
 
@@ -42,7 +44,7 @@ export async function handleProxy(
   const [target, ...rest] = pathAfterProxy.split('/');
 
   if (!isValidTarget(target)) {
-    return err(`Cible inconnue : ${target}. Cibles valides : openai, openrouter, gemini, groq, deepseek`, 400);
+    return err(`Cible inconnue : ${target}. Cibles valides : openai, openrouter, gemini, groq, deepseek, xai`, 400);
   }
 
   const apiKey = getApiKey(target, env);
