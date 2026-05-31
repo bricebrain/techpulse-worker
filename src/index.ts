@@ -934,6 +934,83 @@ export default {
       return json(report);
     }
 
+    // ── GET /admin/stats — monitoring Worker (health check aggrégé) ──────────
+    if (method === 'GET' && path === '/admin/stats') {
+      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+
+      const now = Date.now();
+      const h1  = now - 1  * 60 * 60 * 1000;
+      const h6  = now - 6  * 60 * 60 * 1000;
+      const h24 = now - 24 * 60 * 60 * 1000;
+      const h48 = now - 48 * 60 * 60 * 1000;
+
+      const [
+        total,
+        last1h,
+        last6h,
+        last24h,
+        pending_fr,
+        by_theme,
+        sources,
+        podcasts,
+        devices,
+        latest_podcast,
+        latest_article,
+      ] = await Promise.all([
+        env.DB.prepare('SELECT COUNT(*) as n FROM articles').first<{ n: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h1).first<{ n: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h6).first<{ n: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h24).first<{ n: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE title_fr IS NULL AND fetched_at > ?').bind(h24).first<{ n: number }>(),
+        env.DB.prepare('SELECT theme, COUNT(*) as n FROM articles WHERE fetched_at > ? GROUP BY theme ORDER BY n DESC').bind(h24).all<{ theme: string; n: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as total, SUM(is_active) as active FROM sources').first<{ total: number; active: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as total FROM podcast_feed WHERE is_ready = 1').first<{ total: number }>(),
+        env.DB.prepare('SELECT COUNT(*) as n FROM devices').first<{ n: number }>(),
+        env.DB.prepare('SELECT title, generated_at, format FROM podcast_feed WHERE is_ready = 1 ORDER BY generated_at DESC LIMIT 1').first<{ title: string; generated_at: number; format: string }>(),
+        env.DB.prepare('SELECT title, source_name, fetched_at FROM articles ORDER BY fetched_at DESC LIMIT 1').first<{ title: string; source_name: string; fetched_at: number }>(),
+      ]);
+
+      // Heuristique santé cron : on attend ~15-50 articles toutes les 30min
+      const cron_fetch_ok = (last1h?.n ?? 0) > 0 || (last6h?.n ?? 0) > 5;
+      const translation_ok = (pending_fr?.n ?? 0) < 30;
+
+      // Dernière génération de podcast < 26h → ok
+      const podcast_age_ms = latest_podcast ? now - latest_podcast.generated_at : Infinity;
+      const podcast_ok = podcast_age_ms < 26 * 60 * 60 * 1000;
+
+      return json({
+        ok: cron_fetch_ok && translation_ok,
+        generated_at: now,
+        articles: {
+          total:   total?.n ?? 0,
+          last_1h: last1h?.n ?? 0,
+          last_6h: last6h?.n ?? 0,
+          last_24h: last24h?.n ?? 0,
+          pending_fr: pending_fr?.n ?? 0,
+          by_theme: by_theme.results,
+        },
+        cron: {
+          fetch_ok: cron_fetch_ok,
+          translation_ok,
+          latest_article: latest_article ?? null,
+        },
+        podcast: {
+          total: podcasts?.total ?? 0,
+          ok: podcast_ok,
+          latest: latest_podcast ? {
+            title: latest_podcast.title,
+            format: latest_podcast.format,
+            age_hours: Math.round(podcast_age_ms / 3600000),
+          } : null,
+        },
+        sources: {
+          total: sources?.total ?? 0,
+          active: sources?.active ?? 0,
+        },
+        devices: devices?.n ?? 0,
+      });
+    }
+
     return err('Route inconnue', 404);
   },
 };
