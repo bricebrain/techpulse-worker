@@ -81,9 +81,20 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
   const result = await rows<FeedClusterRow>(sql`
     SELECT c.id, c.title, c.summary, c.main_theme, c.status,
            c.importance_score, c.growth_score, c.novelty_score,
-           c.source_diversity, c.article_count,
+           (
+             SELECT COUNT(DISTINCT a.source_name)
+             FROM cluster_articles ca
+             JOIN articles a ON a.id = ca.article_id
+             WHERE ca.cluster_id = c.id
+           ) AS source_diversity,
+           c.article_count,
            c.first_seen_at, c.last_updated_at, c.created_at,
-           (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score,
+           (
+             c.importance_score
+             + LEAST(c.growth_score, 20) * 2
+             + c.novelty_score * 2
+             + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+           ) AS score,
            COALESCE((
              SELECT jsonb_agg(article_preview ORDER BY article_preview.published_at DESC NULLS LAST)
              FROM (
@@ -106,6 +117,13 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
            ) AS analysis_preview
     FROM clusters c
     WHERE c.status IN ('active', 'growing', 'peak')
+      AND (
+        c.article_count >= 2
+        OR EXISTS (
+          SELECT 1 FROM ai_analyses aa
+          WHERE aa.target_type = 'cluster' AND aa.target_id = c.id
+        )
+      )
     ORDER BY score DESC, c.last_updated_at DESC NULLS LAST
     LIMIT ${limit}
   `);
@@ -123,9 +141,20 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
   const [cluster] = await rows<ClusterRow>(sql`
     SELECT c.id, c.title, c.summary, c.main_theme, c.status,
            c.importance_score, c.growth_score, c.novelty_score,
-           c.source_diversity, c.article_count,
+           (
+             SELECT COUNT(DISTINCT a.source_name)
+             FROM cluster_articles ca
+             JOIN articles a ON a.id = ca.article_id
+             WHERE ca.cluster_id = c.id
+           ) AS source_diversity,
+           c.article_count,
            c.first_seen_at, c.last_updated_at, c.created_at,
-           (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score
+           (
+             c.importance_score
+             + LEAST(c.growth_score, 20) * 2
+             + c.novelty_score * 2
+             + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+           ) AS score
     FROM clusters c
     WHERE c.id = ${clusterId}
     LIMIT 1
@@ -203,6 +232,12 @@ async function getEntities(sql: Sql, url: URL): Promise<Response> {
     FROM entities e
     LEFT JOIN trend_snapshots ts ON ts.entity_id = e.id
       AND ts.snapshot_date >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE e.normalized_name NOT IN (
+      'ai', 'us', 'u.s.', 'u. s.', 'uk', 'reuters', 'bloomberg',
+      'bloomberg tech', 'bloomberg technology', 'hacker news',
+      'techcrunch', 'the verge', 'ars technica', 'cnbc',
+      'ed ludlow', 'caroline hyde'
+    )
     GROUP BY e.id
     ORDER BY e.trend_score DESC, e.mentions_count DESC, e.last_seen_at DESC NULLS LAST
     LIMIT ${limit}
@@ -222,13 +257,29 @@ async function getSignals(sql: Sql, url: URL): Promise<Response> {
     rows<ClusterRow>(sql`
       SELECT c.id, c.title, c.summary, c.main_theme, c.status,
              c.importance_score, c.growth_score, c.novelty_score,
-             c.source_diversity, c.article_count,
+             (
+               SELECT COUNT(DISTINCT a.source_name)
+               FROM cluster_articles ca
+               JOIN articles a ON a.id = ca.article_id
+               WHERE ca.cluster_id = c.id
+             ) AS source_diversity,
+             c.article_count,
              c.first_seen_at, c.last_updated_at, c.created_at,
-             (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score
+             (
+               c.importance_score
+               + LEAST(c.growth_score, 20) * 2
+               + c.novelty_score * 2
+               + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+             ) AS score
       FROM clusters c
       WHERE c.status IN ('active', 'growing')
         AND c.article_count <= ${maxMentions}
-        AND c.source_diversity >= ${minSources}
+        AND (
+          SELECT COUNT(DISTINCT a.source_name)
+          FROM cluster_articles ca
+          JOIN articles a ON a.id = ca.article_id
+          WHERE ca.cluster_id = c.id
+        ) >= ${minSources}
         AND c.growth_score >= ${minGrowth}
         AND c.first_seen_at > NOW() - INTERVAL '72 hours'
       ORDER BY c.growth_score DESC, c.novelty_score DESC, c.importance_score DESC
