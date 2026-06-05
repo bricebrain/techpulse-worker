@@ -1,11 +1,13 @@
 import type { Env, Source } from './types';
-import { runCronFetch, runCronEnrich, runCron, fetchAndStoreSource } from './cron';
+import { runCronFetch, runCronEnrich, runCron, fetchAndStoreSource, sendTestPushAlert } from './cron';
 import { generateDailyPodcast, generateDeepDivePodcast } from './podcast';
 import { generateSuggestions } from './suggester';
 import type { DbSuggestion } from './suggester';
+import { buildSemanticStoryClusters, semanticSearchArticles } from './semanticSearch';
 import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
+import { handleApiV2 } from './api-v2';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -56,6 +58,7 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method;
+    const hasAdminAccess = (): boolean => isAuthorized(req, env.API_SECRET);
 
     // CORS preflight
     if (method === 'OPTIONS') {
@@ -68,17 +71,24 @@ export default {
       });
     }
 
-    // ── /proxy/<target>/... — proxy IA transparent ───────────────────────
+    // ── Routes publiques utilisées par l'app ──────────────────────────────
+
+    // ── /proxy/<target>/... — proxy IA public mais fortement contraint ───
     if (path.startsWith('/proxy/')) {
-      // Pas de secret requis en lecture (l'app est la seule à connaître l'URL)
-      // mais on peut l'activer si besoin : if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      // Le proxy reste public pour l'app, mais n'autorise qu'une petite
+      // allowlist de chemins POST vers les providers réellement utilisés.
       const pathAfterProxy = path.slice('/proxy/'.length); // "openai/v1/chat/completions"
       return handleProxy(req, env, pathAfterProxy);
     }
 
+    const apiV2Response = await handleApiV2(req, env);
+    if (apiV2Response) return apiV2Response;
+
+    // ── Routes privées de maintenance ─────────────────────────────────────
+
 // ── POST /classify/test — test Workers AI sur un titre ───────────────
     if (method === 'POST' && path === '/classify/test') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       const body = await req.json<{ title?: string; content?: string }>().catch(() => null);
       const { classifyArticle } = await import('./classifier');
       const theme = await classifyArticle(env.AI, {
@@ -118,6 +128,14 @@ export default {
              ORDER BY published_at DESC, fetched_at DESC
              LIMIT ?`
           ).bind(limit).all()
+        : theme === 'general'
+        ? await env.DB.prepare(
+            `SELECT * FROM articles
+             WHERE theme IN ('general', 'mobile')
+                OR (theme = 'youtube' AND classified_theme IN ('general', 'mobile'))
+             ORDER BY published_at DESC, fetched_at DESC
+             LIMIT ?`
+          ).bind(limit).all()
         : await env.DB.prepare(
             `SELECT * FROM articles
              WHERE theme = ? OR (theme = 'youtube' AND classified_theme = ?)
@@ -154,6 +172,43 @@ export default {
       return json({ articles: results, query: q, count: results.length });
     }
 
+    // ── GET /articles/semantic-search?q=...&limit=20 — recherche sémantique ─
+    if (method === 'GET' && path === '/articles/semantic-search') {
+      const q = url.searchParams.get('q')?.trim() ?? '';
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? '20'), 40);
+
+      if (q.length < 2) return json({ articles: [], query: q, count: 0, provider: null, model: null });
+
+      const result = await semanticSearchArticles(q, env, limit);
+      return json({
+        articles: result.articles,
+        query: q,
+        count: result.articles.length,
+        provider: result.provider,
+        model: result.model,
+      });
+    }
+
+    // ── GET /stories/recent?limit=8&hours=72 — sujets consolidés ─────────
+    if (method === 'GET' && path === '/stories/recent') {
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? '8'), 20);
+      const hours = Math.min(Number(url.searchParams.get('hours') ?? '72'), 24 * 14);
+      const maxArticlesPerStory = Math.min(Number(url.searchParams.get('per_story') ?? '5'), 8);
+
+      const result = await buildSemanticStoryClusters(env, {
+        limit,
+        hours,
+        maxArticlesPerStory,
+      });
+
+      return json({
+        stories: result.stories,
+        count: result.stories.length,
+        provider: result.provider,
+        model: result.model,
+      });
+    }
+
     // ── GET /articles/recent?limit=15&hours=12 — breaking news cross-thème ─
     if (method === 'GET' && path === '/articles/recent') {
       const limit = Math.min(Number(url.searchParams.get('limit') ?? '15'), 50);
@@ -179,7 +234,11 @@ export default {
     // ── GET /articles/themes — liste des thèmes disponibles ──────────────
     if (method === 'GET' && path === '/articles/themes') {
       const { results } = await env.DB.prepare(
-        'SELECT DISTINCT theme FROM articles ORDER BY theme ASC'
+        `SELECT DISTINCT
+           CASE WHEN theme = 'mobile' THEN 'general' ELSE theme END AS theme
+         FROM articles
+         WHERE theme != 'productivity'
+         ORDER BY theme ASC`
       ).all<{ theme: string }>();
       return json({ themes: results.map((r) => r.theme) });
     }
@@ -197,7 +256,7 @@ export default {
 
     // ── POST /sources — ajouter une source (requiert API_SECRET) ─────────
     if (method === 'POST' && path === '/sources') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const body = await req.json<Partial<Source>>().catch(() => null);
       if (!body?.name || !body.theme || !body.type || !body.value) {
@@ -227,7 +286,7 @@ export default {
 
     // ── POST /sources/sync — upsert bulk depuis l'app mobile ─────────────
     if (method === 'POST' && path === '/sources/sync') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const body = await req.json<{ sources?: Partial<Source>[] }>().catch(() => null);
       const list = body?.sources ?? [];
@@ -281,7 +340,7 @@ export default {
 
     // ── PUT /sources/:id ──────────────────────────────────────────────────
     if (method === 'PUT' && path.startsWith('/sources/')) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const id = path.split('/')[2];
       const body = await req.json<Partial<Source>>().catch(() => null);
@@ -302,7 +361,7 @@ export default {
 
     // ── DELETE /sources/:id ───────────────────────────────────────────────
     if (method === 'DELETE' && path.startsWith('/sources/')) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const id = path.split('/')[2];
       await env.DB.prepare('DELETE FROM sources WHERE id = ?').bind(id).run();
@@ -312,7 +371,7 @@ export default {
     // ── POST /articles/ingest — ingestion d'articles depuis l'app mobile ────
     // Utilisé pour pousser les articles Reddit (IP téléphone non bloquée par Reddit)
     if (method === 'POST' && path === '/articles/ingest') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       interface IngestArticle {
         hash?: string;
@@ -344,42 +403,87 @@ export default {
 
     // ── POST /devices/register — enregistrer token push + keywords ────────
     if (method === 'POST' && path === '/devices/register') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
-
       const body = await req.json<{ token?: string; platform?: string; keywords?: string[] }>().catch(() => null);
       if (!body?.token) return err('token requis');
+      const token = body.token.trim();
+      if (token.length < 16 || token.length > 4096) return err('token invalide');
 
       const now = new Date().toISOString();
-      const keywords = JSON.stringify((body.keywords ?? []).map((k) => k.trim().toLowerCase()).filter(Boolean));
+      const keywords = JSON.stringify(
+        (body.keywords ?? [])
+          .map((k) => k.trim().toLowerCase())
+          .filter((k) => k.length > 0 && k.length <= 64)
+          .slice(0, 20),
+      );
+      const platform = (body.platform ?? 'unknown').trim().slice(0, 32) || 'unknown';
 
       await env.DB.prepare(
         `INSERT INTO devices (token, platform, keywords, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(token) DO UPDATE SET keywords = excluded.keywords, updated_at = excluded.updated_at`
-      ).bind(body.token, body.platform ?? 'unknown', keywords, now, now).run();
+      ).bind(token, platform, keywords, now, now).run();
 
       return json({ registered: true });
     }
 
     // ── DELETE /devices/:token — désenregistrer un appareil ────────────────
     if (method === 'DELETE' && path.startsWith('/devices/')) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
       const token = decodeURIComponent(path.split('/')[2] ?? '');
-      if (!token) return err('token requis');
+      if (!token || token.length < 16 || token.length > 4096) return err('token invalide');
       await env.DB.prepare('DELETE FROM devices WHERE token = ?').bind(token).run();
       return json({ unregistered: true });
     }
 
+    // ── POST /push/test — envoi manuel d'une notification de test ────────
+    if (method === 'POST' && path === '/push/test') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+
+      const body = await req.json<{
+        token?: string;
+        title?: string;
+        body?: string;
+        theme?: string;
+        hash?: string;
+      }>().catch(() => null);
+
+      let token = body?.token?.trim() ?? '';
+      if (!token) {
+        const latest = await env.DB.prepare(
+          'SELECT token FROM devices ORDER BY updated_at DESC LIMIT 1'
+        ).first<{ token: string }>();
+        token = latest?.token?.trim() ?? '';
+      }
+
+      if (!token || token.length < 16 || token.length > 4096) {
+        return err('Aucun token device exploitable trouvé', 404);
+      }
+
+      const responses = await sendTestPushAlert(token, {
+        title: body?.title,
+        body: body?.body,
+        data: {
+          theme: body?.theme?.trim() || 'ai',
+          hash: body?.hash?.trim() || 'push-test',
+        },
+      });
+
+      return json({
+        sent: true,
+        token,
+        responses,
+      });
+    }
+
     // ── POST /cron/trigger — déclencher le cron fetch manuellement ───────
     if (method === 'POST' && path === '/cron/trigger') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       ctx.waitUntil(runCronFetch(env));
       return json({ message: 'Cron fetch lancé en arrière-plan' });
     }
 
     // ── POST /cron/enrich — traduction FR + classification ────────────────
     if (method === 'POST' && path === '/cron/enrich') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       ctx.waitUntil(runCronEnrich(env));
       return json({ message: 'Cron enrich lancé en arrière-plan' });
     }
@@ -443,7 +547,7 @@ export default {
 
     // ── POST /podcasts/generate — TechBrief quotidien manuellement ────────
     if (method === 'POST' && path === '/podcasts/generate') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       // ?sync=1 : attend la fin et retourne le résultat (debug uniquement)
       if (url.searchParams.get('sync') === '1') {
         const t0 = Date.now();
@@ -468,7 +572,7 @@ export default {
 
     // ── DELETE /podcasts/:id — supprimer un podcast (D1 + R2) ───────────────
     if (method === 'DELETE' && path.startsWith('/podcasts/') && path.split('/').length === 3) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       const podId = path.split('/')[2];
       if (!podId) return err('ID manquant');
 
@@ -492,7 +596,7 @@ export default {
 
     // ── POST /podcasts/generate-deep-dive — Deep Dive manuellement ─────────
     if (method === 'POST' && path === '/podcasts/generate-deep-dive') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       ctx.waitUntil(generateDeepDivePodcast(env));
       return json({ message: 'Génération Deep Dive lancée en arrière-plan' });
     }
@@ -515,7 +619,7 @@ export default {
 
     // ── POST /suggestions/:id/apply — appliquer une suggestion ───────────
     if (method === 'POST' && path.startsWith('/suggestions/') && path.endsWith('/apply')) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const id = path.split('/')[2];
       const sug = await env.DB.prepare(
@@ -577,7 +681,7 @@ export default {
 
     // ── DELETE /suggestions/:id — ignorer une suggestion ─────────────────
     if (method === 'DELETE' && path.startsWith('/suggestions/')) {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const id = path.split('/')[2];
       await env.DB.prepare(
@@ -589,7 +693,7 @@ export default {
 
     // ── POST /suggestions/generate — déclencher manuellement ─────────────
     if (method === 'POST' && path === '/suggestions/generate') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       ctx.waitUntil(generateSuggestions(env));
       return json({ message: 'Analyse de suggestions lancée en arrière-plan' });
     }
@@ -597,10 +701,12 @@ export default {
     // ── GET /analyses?hashes=h1,h2,... — batch fetch analyses depuis D1 ───────
     // Utilisé par l'app avant de lancer l'IA : "est-ce que cette analyse existe déjà ?"
     if (method === 'GET' && path === '/analyses') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
-
       const rawHashes = url.searchParams.get('hashes') ?? '';
-      const hashes = rawHashes.split(',').map((h) => h.trim()).filter(Boolean).slice(0, 50);
+      const hashes = rawHashes
+        .split(',')
+        .map((h) => h.trim())
+        .filter((h) => /^[a-z0-9_-]{4,120}$/i.test(h))
+        .slice(0, 50);
       if (!hashes.length) return json({ analyses: [] });
 
       const placeholders = hashes.map(() => '?').join(',');
@@ -621,8 +727,6 @@ export default {
     // ── POST /analyses — upsert une ou plusieurs analyses ────────────────────
     // L'app pousse l'analyse après génération IA locale.
     if (method === 'POST' && path === '/analyses') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
-
       interface AnalysisInput {
         article_hash: string;
         title: string;
@@ -637,9 +741,18 @@ export default {
       }
 
       const body = await req.json<{ analyses?: AnalysisInput[]; analysis?: AnalysisInput }>().catch(() => null);
-      const list: AnalysisInput[] = body?.analyses ?? (body?.analysis ? [body.analysis] : []);
+      const list: AnalysisInput[] = (body?.analyses ?? (body?.analysis ? [body.analysis] : [])).slice(0, 20);
 
-      const valid = list.filter((a) => a.article_hash && a.title);
+      const valid = list.filter((a) =>
+        /^[a-z0-9_-]{4,120}$/i.test(a.article_hash)
+        && typeof a.title === 'string'
+        && a.title.trim().length > 0
+        && a.title.length <= 300
+        && (a.analysis_en == null || a.analysis_en.length <= 20_000)
+        && (a.summary_fr == null || a.summary_fr.length <= 5_000)
+        && (a.impact_fr == null || a.impact_fr.length <= 5_000)
+        && (a.analysis_data == null || a.analysis_data.length <= 50_000),
+      );
       if (!valid.length) return json({ upserted: 0 });
 
       const now = Date.now();
@@ -672,8 +785,6 @@ export default {
     // ── GET /analyses/radar — Tech Radar aggrégé sur les analyses D1 ─────────
     // Retourne signaux, technos, horizons, et exemples récents par signal.
     if (method === 'GET' && path === '/analyses/radar') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
-
       const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000; // 90 jours
 
       const [signals, rawAnalyses, total] = await Promise.all([
@@ -757,7 +868,7 @@ export default {
 
     // ── POST /podcasts/debug2 — trace étape par étape de la génération ──────
     if (method === 'POST' && path === '/podcasts/debug2') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const steps: Record<string, unknown> = { ts: Date.now() };
 
@@ -852,7 +963,7 @@ export default {
 
     // ── POST /podcasts/debug — diagnostic complet de la chaîne TTS ────────
     if (method === 'POST' && path === '/podcasts/debug') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const report: Record<string, unknown> = {};
 
@@ -987,7 +1098,7 @@ export default {
 
     // ── POST /grok/fetch — teste + insère toutes les sources grok_live ────
     if (method === 'POST' && path === '/grok/fetch') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       const { fetchGrokLive } = await import('./fetchers/grok');
 
       const { results: grokSources } = await env.DB.prepare(
@@ -1018,7 +1129,7 @@ export default {
 
     // ── POST /grok/test — test rapide Grok live search (Responses API) ───
     if (method === 'POST' && path === '/grok/test') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       const report: Record<string, unknown> = { has_key: !!env.XAI_API_KEY };
       if (!env.XAI_API_KEY) return json({ ...report, error: 'XAI_API_KEY manquant' });
 
@@ -1057,7 +1168,7 @@ export default {
 
     // ── POST /grok/llm-test — test grok-4.3 chat completions (même API que podcast) ──
     if (method === 'POST' && path === '/grok/llm-test') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
       const report: Record<string, unknown> = { has_key: !!env.XAI_API_KEY, model: 'grok-4.3' };
       if (!env.XAI_API_KEY) return json({ ...report, error: 'XAI_API_KEY manquant' });
 
@@ -1097,20 +1208,18 @@ export default {
 
     // ── GET /admin/stats — monitoring Worker (health check aggrégé) ──────────
     if (method === 'GET' && path === '/admin/stats') {
-      if (!isAuthorized(req, env.API_SECRET)) return err('Non autorisé', 401);
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
 
       const now = Date.now();
       const h1  = now - 1  * 60 * 60 * 1000;
       const h6  = now - 6  * 60 * 60 * 1000;
       const h24 = now - 24 * 60 * 60 * 1000;
-      const h48 = now - 48 * 60 * 60 * 1000;
 
       const [
         total,
         last1h,
         last6h,
         last24h,
-        pending_fr,
         by_theme,
         sources,
         podcasts,
@@ -1122,7 +1231,6 @@ export default {
         env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h1).first<{ n: number }>(),
         env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h6).first<{ n: number }>(),
         env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE fetched_at > ?').bind(h24).first<{ n: number }>(),
-        env.DB.prepare('SELECT COUNT(*) as n FROM articles WHERE title_fr IS NULL AND fetched_at > ?').bind(h24).first<{ n: number }>(),
         env.DB.prepare('SELECT theme, COUNT(*) as n FROM articles WHERE fetched_at > ? GROUP BY theme ORDER BY n DESC').bind(h24).all<{ theme: string; n: number }>(),
         env.DB.prepare('SELECT COUNT(*) as total, SUM(is_active) as active FROM sources').first<{ total: number; active: number }>(),
         env.DB.prepare('SELECT COUNT(*) as total FROM podcast_feed WHERE is_ready = 1').first<{ total: number }>(),
@@ -1133,26 +1241,26 @@ export default {
 
       // Heuristique santé cron : on attend ~15-50 articles toutes les 30min
       const cron_fetch_ok = (last1h?.n ?? 0) > 0 || (last6h?.n ?? 0) > 5;
-      const translation_ok = (pending_fr?.n ?? 0) < 30;
 
       // Dernière génération de podcast < 26h → ok
       const podcast_age_ms = latest_podcast ? now - latest_podcast.generated_at : Infinity;
       const podcast_ok = podcast_age_ms < 26 * 60 * 60 * 1000;
 
       return json({
-        ok: cron_fetch_ok && translation_ok,
+        ok: cron_fetch_ok && podcast_ok,
         generated_at: now,
         articles: {
           total:   total?.n ?? 0,
           last_1h: last1h?.n ?? 0,
           last_6h: last6h?.n ?? 0,
           last_24h: last24h?.n ?? 0,
-          pending_fr: pending_fr?.n ?? 0,
+          pending_fr: 0,
           by_theme: by_theme.results,
         },
         cron: {
           fetch_ok: cron_fetch_ok,
-          translation_ok,
+          translation_ok: true,
+          translation_mode: 'disabled',
           latest_article: latest_article ?? null,
         },
         podcast: {

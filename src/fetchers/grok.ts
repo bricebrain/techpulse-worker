@@ -8,6 +8,7 @@
  */
 
 import type { Env, Source, Article } from '../types';
+import { resolveSecrets } from '../types';
 import { makeHash } from '../utils';
 
 interface GrokArticle {
@@ -29,14 +30,39 @@ interface XAIResponsesResult {
   status?: string;
 }
 
-function buildPrompt(query: string, limit: number): string {
+function getThemeGuidance(theme: string): string {
+  switch (theme) {
+    case 'ai':
+      return 'Prioritize frontier model launches, inference infrastructure, AI chips, compute partnerships, hyperscaler AI capex, enterprise platform moves, and meaningful developer tooling announcements.';
+    case 'finance':
+      return 'Prioritize market-moving developments in tech finance: earnings, semiconductor demand, cloud margins, AI capex, fintech infrastructure, crypto market structure, ETF flows, regulation, funding, and M&A.';
+    case 'general':
+      return 'Prioritize developer platforms, software infrastructure, browser and runtime changes, backend tooling, cloud launches, databases, notable framework releases, and engineering announcements from major tech companies.';
+    default:
+      return 'Prioritize timely, high-signal developments that matter in a professional technology and finance watch workflow.';
+  }
+}
+
+function buildPrompt(source: Source, limit: number): string {
+  const themeGuidance = getThemeGuidance(source.theme);
   return (
-    `Search the web right now for: "${query}".\n\n` +
-    `Return exactly the ${limit} most recent news articles (published in the last 48 hours) as a valid JSON array:\n` +
+    `Search the web right now for this watch query: "${source.value}".\n\n` +
+    `Context:\n` +
+    `- Theme: ${source.theme}\n` +
+    `- Source profile: ${source.name}\n` +
+    `- Goal: find early, high-signal developments that are useful in a professional watch product.\n\n` +
+    `Editorial guidance:\n` +
+    `- ${themeGuidance}\n` +
+    `- Prefer primary or high-credibility reporting when possible.\n` +
+    `- Prefer concrete news, launches, filings, earnings, partnerships, regulation, product updates, or engineering changes.\n` +
+    `- Avoid generic explainers, tutorials, jobs, opinion pieces, listicles, evergreen content, and low-value recap posts.\n` +
+    `- Avoid returning near-duplicate articles that all say the same thing.\n\n` +
+    `Return exactly the ${limit} strongest and most recent news articles (published in the last 48 hours) as a valid JSON array:\n` +
     `[{"title":"...","url":"https://...","summary":"2-3 sentence summary in English","published_at":"2026-05-31T10:00:00Z"},...]\n\n` +
     `Rules:\n` +
     `- Only real articles published in the last 48 hours\n` +
     `- Real URLs only (no placeholders)\n` +
+    `- Summaries must explain the specific signal, not just repeat the headline\n` +
     `- No markdown, no commentary — ONLY the JSON array`
   );
 }
@@ -70,21 +96,21 @@ function parseArticles(text: string): GrokArticle[] {
 }
 
 export async function fetchGrokLive(source: Source, env: Env): Promise<Article[]> {
-  if (!env.XAI_API_KEY) {
+  const { XAI_API_KEY } = await resolveSecrets(env);
+  if (!XAI_API_KEY) {
     console.warn('[Grok] XAI_API_KEY non configurée — source ignorée');
     return [];
   }
 
-  const query = source.value;
   const limit = Math.min(source.limit_count ?? 10, 15);
 
-  console.log(`[Grok] Fetch live : "${query.slice(0, 60)}" (limite ${limit})`);
+  console.log(`[Grok] Fetch live : "${source.value.slice(0, 60)}" (limite ${limit})`);
 
   try {
     const res = await fetch('https://api.x.ai/v1/responses', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${env.XAI_API_KEY}`,
+        Authorization: `Bearer ${XAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -92,7 +118,7 @@ export async function fetchGrokLive(source: Source, env: Env): Promise<Article[]
         input: [
           {
             role: 'user',
-            content: buildPrompt(query, limit),
+            content: buildPrompt(source, limit),
           },
         ],
         tools: [{ type: 'web_search' }],

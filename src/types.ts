@@ -1,32 +1,70 @@
+/** Secret issu du Cloudflare Secrets Store — accès async via .get() */
+interface SecretsStoreSecret {
+  get(): Promise<string>;
+}
+
+/** Clés API résolues (plain strings) pour passer aux helpers */
+export interface ResolvedSecrets {
+  OPENAI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
+  GEMINI_API_KEY: string;
+  GROQ_API_KEY_1: string;
+  GROQ_API_KEY_2: string;
+  DEEPSEEK_API_KEY: string;
+  XAI_API_KEY: string;
+}
+
+/**
+ * Résout toutes les clés du Secrets Store en parallèle.
+ * À appeler une seule fois en tête de chaque handler/cron qui en a besoin.
+ */
+export async function resolveSecrets(env: Env): Promise<ResolvedSecrets> {
+  const [openai, openrouter, gemini, groq1, groq2, deepseek, xai] = await Promise.all([
+    env.OPENAI_API_KEY.get(),
+    env.OPENROUTER_API_KEY.get(),
+    env.GEMINI_API_KEY.get(),
+    env.GROQ_API_KEY_1.get(),
+    env.GROQ_API_KEY_2.get(),
+    env.DEEPSEEK_API_KEY.get(),
+    env.XAI_API_KEY.get(),
+  ]);
+  return {
+    OPENAI_API_KEY: openai,
+    OPENROUTER_API_KEY: openrouter,
+    GEMINI_API_KEY: gemini,
+    GROQ_API_KEY_1: groq1,
+    GROQ_API_KEY_2: groq2,
+    DEEPSEEK_API_KEY: deepseek,
+    XAI_API_KEY: xai,
+  };
+}
+
 export interface Env {
   DB: D1Database;
   AI: Ai;
-  // Secrets (définis via `wrangler secret put`)
+  // Cloudflare Secrets Store — partagés entre workers (accès async via .get())
+  OPENAI_API_KEY: SecretsStoreSecret;
+  OPENROUTER_API_KEY: SecretsStoreSecret;
+  GEMINI_API_KEY: SecretsStoreSecret;
+  GROQ_API_KEY_1: SecretsStoreSecret;
+  GROQ_API_KEY_2: SecretsStoreSecret;
+  DEEPSEEK_API_KEY: SecretsStoreSecret;
+  XAI_API_KEY: SecretsStoreSecret;
+  // Secrets spécifiques TechPulse (wrangler secret put)
   YOUTUBE_API_KEY_1?: string;
   YOUTUBE_API_KEY_2?: string;
   YOUTUBE_API_KEY_3?: string;
   YOUTUBE_SEARCH_KEY_1?: string;
   YOUTUBE_SEARCH_KEY_2?: string;
   YOUTUBE_SEARCH_KEY_3?: string;
-  OPENAI_API_KEY?: string;
-  GROQ_API_KEY_1?: string;
-  GROQ_API_KEY_2?: string;
   GROQ_TTS_KEY_1?: string;
   GROQ_TTS_KEY_2?: string;
-  OPENROUTER_API_KEY?: string;
-  GEMINI_API_KEY?: string;
-  DEEPSEEK_API_KEY?: string;
-  // Clé pour sécuriser les routes d'écriture depuis l'app
   API_SECRET?: string;
-  // Hugging Face — Inference API (TTS Parler-TTS, etc.)
   HF_TOKEN?: string;
-  // Proxy FastAPI (Render) pour contourner le blocage IP Reddit
-  REDDIT_PROXY_URL?: string;    // ex: https://techpulse-api.onrender.com
-  REDDIT_PROXY_SECRET?: string; // partagé avec la variable reddit_proxy_secret de FastAPI
-  // R2 bucket pour les podcasts auto-générés (optionnel — activer R2 dans le dashboard CF d'abord)
+  REDDIT_PROXY_URL?: string;
+  REDDIT_PROXY_SECRET?: string;
+  NEON_DATABASE_URL?: string;
   PODCASTS?: R2Bucket;
-  // xAI — Grok live search (actualités tech/finance en temps réel)
-  XAI_API_KEY?: string;
 }
 
 export interface Source {

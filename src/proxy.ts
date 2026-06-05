@@ -5,6 +5,7 @@
  */
 
 import type { Env } from './types';
+import { resolveSecrets } from './types';
 import { err } from './utils';
 
 type ProxyTarget = 'openai' | 'openrouter' | 'gemini' | 'groq' | 'deepseek' | 'xai';
@@ -18,16 +19,13 @@ const TARGET_URLS: Record<ProxyTarget, string> = {
   xai:         'https://api.x.ai',
 };
 
-function getApiKey(target: ProxyTarget, env: Env): string | undefined {
-  switch (target) {
-    case 'openai':     return env.OPENAI_API_KEY;
-    case 'openrouter': return env.OPENROUTER_API_KEY;
-    case 'gemini':     return env.GEMINI_API_KEY;
-    case 'groq':       return env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2 ?? env.GROQ_TTS_KEY_1 ?? env.GROQ_TTS_KEY_2;
-    case 'deepseek':   return env.DEEPSEEK_API_KEY;
-    case 'xai':        return env.XAI_API_KEY;
-  }
-}
+const EXACT_ALLOWED_PATHS: Record<Exclude<ProxyTarget, 'gemini'>, string[]> = {
+  openai: ['/v1/chat/completions', '/v1/audio/speech'],
+  openrouter: ['/v1/chat/completions'],
+  groq: ['/openai/v1/chat/completions'],
+  deepseek: ['/v1/chat/completions'],
+  xai: ['/v1/chat/completions', '/v1/responses'],
+};
 
 /**
  * Proxifie une requête vers l'API cible.
@@ -41,18 +39,39 @@ export async function handleProxy(
   env: Env,
   pathAfterProxy: string,   // ex: "openai/v1/chat/completions"
 ): Promise<Response> {
+  if (req.method !== 'POST') {
+    return err('Méthode non autorisée pour le proxy', 405);
+  }
+
   const [target, ...rest] = pathAfterProxy.split('/');
 
   if (!isValidTarget(target)) {
     return err(`Cible inconnue : ${target}. Cibles valides : openai, openrouter, gemini, groq, deepseek, xai`, 400);
   }
 
-  const apiKey = getApiKey(target, env);
+  const secrets = await resolveSecrets(env);
+
+  function getApiKey(t: ProxyTarget): string | undefined {
+    switch (t) {
+      case 'openai':     return secrets.OPENAI_API_KEY || undefined;
+      case 'openrouter': return secrets.OPENROUTER_API_KEY || undefined;
+      case 'gemini':     return secrets.GEMINI_API_KEY || undefined;
+      case 'groq':       return secrets.GROQ_API_KEY_1 || secrets.GROQ_API_KEY_2 || env.GROQ_TTS_KEY_1 || env.GROQ_TTS_KEY_2;
+      case 'deepseek':   return secrets.DEEPSEEK_API_KEY || undefined;
+      case 'xai':        return secrets.XAI_API_KEY || undefined;
+    }
+  }
+
+  const apiKey = getApiKey(target);
   if (!apiKey) {
     return err(`Clé non configurée pour : ${target}`, 503);
   }
 
   const upstreamPath = '/' + rest.join('/');
+  if (!isAllowedProxyPath(target, upstreamPath)) {
+    return err(`Chemin proxy non autorisé pour ${target}: ${upstreamPath}`, 403);
+  }
+
   const originalUrl = new URL(req.url);
   const upstreamUrl = TARGET_URLS[target] + upstreamPath + (originalUrl.search ?? '');
 
@@ -76,7 +95,7 @@ export async function handleProxy(
       const upstreamReq = new Request(url.toString(), {
         method: req.method,
         headers,
-        body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : null,
+        body: req.body,
       });
       const res = await fetch(upstreamReq);
       return proxyResponse(res);
@@ -88,7 +107,7 @@ export async function handleProxy(
   const upstreamReq = new Request(upstreamUrl, {
     method: req.method,
     headers,
-    body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : null,
+    body: req.body,
   });
 
   const res = await fetch(upstreamReq);
@@ -108,4 +127,13 @@ function proxyResponse(res: Response): Response {
 
 function isValidTarget(value: string): value is ProxyTarget {
   return value in TARGET_URLS;
+}
+
+function isAllowedProxyPath(target: ProxyTarget, upstreamPath: string): boolean {
+  if (target === 'gemini') {
+    return upstreamPath === '/v1beta/openai/chat/completions'
+      || /^\/v1beta\/models\/[^/]+:generateContent$/.test(upstreamPath);
+  }
+
+  return EXACT_ALLOWED_PATHS[target].includes(upstreamPath);
 }

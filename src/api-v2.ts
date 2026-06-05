@@ -1,0 +1,255 @@
+import { neon } from '@neondatabase/serverless';
+import type { NeonQueryFunction } from '@neondatabase/serverless';
+import {
+  asArray,
+  normalizeAnalysis,
+  normalizeArticle,
+  normalizeCluster,
+  normalizeEntity,
+  parseNumber,
+  toIso,
+} from './api-v2-mappers';
+import type {
+  AnalysisRow,
+  ArticleRow,
+  ClusterRow,
+  EntityRow,
+  FeedClusterRow,
+  TimelineEventRow,
+} from './api-v2-types';
+import type { Env } from './types';
+import { err, json } from './utils';
+
+type Sql = NeonQueryFunction<false, false>;
+
+function getSql(env: Env): Sql | Response {
+  if (!env.NEON_DATABASE_URL) {
+    return err('NEON_DATABASE_URL non configuré', 503);
+  }
+  return neon(env.NEON_DATABASE_URL);
+}
+
+async function rows<T>(query: Promise<unknown>): Promise<T[]> {
+  return (await query) as T[];
+}
+
+function parseLimit(url: URL, defaultValue: number, max: number): number {
+  const raw = Number(url.searchParams.get('limit') ?? defaultValue);
+  if (!Number.isFinite(raw)) return defaultValue;
+  return Math.max(1, Math.min(Math.trunc(raw), max));
+}
+
+export async function handleApiV2(req: Request, env: Env): Promise<Response | null> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  if (!path.startsWith('/api/v2/')) return null;
+  if (req.method !== 'GET') return err('Méthode non autorisée', 405);
+
+  const sqlOrResponse = getSql(env);
+  if (sqlOrResponse instanceof Response) return sqlOrResponse;
+  const sql = sqlOrResponse;
+
+  try {
+    if (path === '/api/v2/feed') {
+      return getFeed(sql, url);
+    }
+
+    if (path.startsWith('/api/v2/cluster/')) {
+      const id = decodeURIComponent(path.slice('/api/v2/cluster/'.length)).trim();
+      if (!id) return err('ID cluster requis');
+      return getClusterDetail(sql, id);
+    }
+
+    if (path === '/api/v2/entities') {
+      return getEntities(sql, url);
+    }
+
+    if (path === '/api/v2/signals') {
+      return getSignals(sql, url);
+    }
+
+    return err('Route API v2 inconnue', 404);
+  } catch (error) {
+    console.error('[api-v2] Neon query failed', error);
+    return err('Erreur de lecture Neon', 500);
+  }
+}
+
+async function getFeed(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 30, 100);
+  const result = await rows<FeedClusterRow>(sql`
+    SELECT c.id, c.title, c.summary, c.main_theme, c.status,
+           c.importance_score, c.growth_score, c.novelty_score,
+           c.source_diversity, c.article_count,
+           c.first_seen_at, c.last_updated_at, c.created_at,
+           (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score,
+           COALESCE((
+             SELECT jsonb_agg(article_preview ORDER BY article_preview.published_at DESC NULLS LAST)
+             FROM (
+               SELECT a.id, a.title, a.description, a.source_name, a.source_type,
+                      a.url, a.image_url, a.category, a.sentiment, a.published_at,
+                      ca.role, ca.similarity_score
+               FROM cluster_articles ca
+               JOIN articles a ON a.id = ca.article_id
+               WHERE ca.cluster_id = c.id
+               ORDER BY (ca.role = 'primary') DESC, a.published_at DESC NULLS LAST
+               LIMIT 3
+             ) AS article_preview
+           ), '[]'::jsonb) AS preview_articles,
+           (
+             SELECT aa.content
+             FROM ai_analyses aa
+             WHERE aa.target_type = 'cluster' AND aa.target_id = c.id
+             ORDER BY aa.created_at DESC
+             LIMIT 1
+           ) AS analysis_preview
+    FROM clusters c
+    WHERE c.status IN ('active', 'growing', 'peak')
+    ORDER BY score DESC, c.last_updated_at DESC NULLS LAST
+    LIMIT ${limit}
+  `);
+
+  const clusters = result.map((row) => ({
+    ...normalizeCluster(row),
+    preview_articles: asArray(row.preview_articles),
+    analysis_preview: row.analysis_preview ?? null,
+  }));
+
+  return json({ clusters, count: clusters.length, source: 'neon' });
+}
+
+async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> {
+  const [cluster] = await rows<ClusterRow>(sql`
+    SELECT c.id, c.title, c.summary, c.main_theme, c.status,
+           c.importance_score, c.growth_score, c.novelty_score,
+           c.source_diversity, c.article_count,
+           c.first_seen_at, c.last_updated_at, c.created_at,
+           (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score
+    FROM clusters c
+    WHERE c.id = ${clusterId}
+    LIMIT 1
+  `);
+
+  if (!cluster) return err('Cluster introuvable', 404);
+
+  const [articles, analyses, entities, timeline] = await Promise.all([
+    rows<ArticleRow>(sql`
+      SELECT a.id, a.title, a.description, a.source_name, a.source_type,
+             a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
+             a.external_score, a.comments_count, a.published_at, a.fetched_at,
+             ca.role, ca.similarity_score
+      FROM articles a
+      JOIN cluster_articles ca ON ca.article_id = a.id
+      WHERE ca.cluster_id = ${clusterId}
+      ORDER BY (ca.role = 'primary') DESC, ca.similarity_score DESC NULLS LAST,
+               a.published_at DESC NULLS LAST
+    `),
+    rows<AnalysisRow>(sql`
+      SELECT id, target_type, target_id, model_provider, model_name,
+             analysis_type, content, tokens_used, cost_estimate, created_at
+      FROM ai_analyses
+      WHERE target_type = 'cluster' AND target_id = ${clusterId}
+      ORDER BY created_at DESC
+      LIMIT 5
+    `),
+    rows<EntityRow>(sql`
+      SELECT e.id, e.name, e.normalized_name, e.type, e.description,
+             e.mentions_count, e.trend_score, e.first_seen_at, e.last_seen_at,
+             0 AS latest_growth_rate, 0 AS seven_day_mentions, 0 AS seven_day_sources
+      FROM entities e
+      JOIN article_entities ae ON ae.entity_id = e.id
+      JOIN cluster_articles ca ON ca.article_id = ae.article_id
+      WHERE ca.cluster_id = ${clusterId}
+      GROUP BY e.id
+      ORDER BY e.trend_score DESC, e.mentions_count DESC
+      LIMIT 30
+    `),
+    rows<TimelineEventRow>(sql`
+      SELECT id, title, description, event_date, importance, source_article_id
+      FROM timeline_events
+      WHERE cluster_id = ${clusterId}
+      ORDER BY event_date DESC NULLS LAST, importance DESC
+      LIMIT 20
+    `),
+  ]);
+
+  return json({
+    cluster: normalizeCluster(cluster),
+    articles: articles.map(normalizeArticle),
+    analyses: analyses.map(normalizeAnalysis),
+    latest_analysis: analyses[0] ? normalizeAnalysis(analyses[0]) : null,
+    entities: entities.map(normalizeEntity),
+    timeline: timeline.map((event) => ({
+      id: event.id,
+      title: event.title,
+      description: event.description,
+      event_date: toIso(event.event_date),
+      importance: parseNumber(event.importance),
+      source_article_id: event.source_article_id,
+    })),
+    source: 'neon',
+  });
+}
+
+async function getEntities(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 40, 100);
+  const result = await rows<EntityRow>(sql`
+    SELECT e.id, e.name, e.normalized_name, e.type, e.description,
+           e.mentions_count, e.trend_score, e.first_seen_at, e.last_seen_at,
+           COALESCE(MAX(ts.growth_rate), 0) AS latest_growth_rate,
+           COALESCE(SUM(ts.mention_count), 0) AS seven_day_mentions,
+           COALESCE(SUM(ts.source_count), 0) AS seven_day_sources
+    FROM entities e
+    LEFT JOIN trend_snapshots ts ON ts.entity_id = e.id
+      AND ts.snapshot_date >= CURRENT_DATE - INTERVAL '7 days'
+    GROUP BY e.id
+    ORDER BY e.trend_score DESC, e.mentions_count DESC, e.last_seen_at DESC NULLS LAST
+    LIMIT ${limit}
+  `);
+
+  const entities = result.map(normalizeEntity);
+  return json({ entities, count: entities.length, source: 'neon' });
+}
+
+async function getSignals(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 10, 50);
+  const maxMentions = Math.max(1, Math.min(Number(url.searchParams.get('max_mentions') ?? 15), 100));
+  const minSources = Math.max(1, Math.min(Number(url.searchParams.get('min_sources') ?? 2), 10));
+  const minGrowth = Math.max(0, Math.min(Number(url.searchParams.get('min_growth') ?? 10), 500));
+
+  const [clusters, weakSignalAnalyses] = await Promise.all([
+    rows<ClusterRow>(sql`
+      SELECT c.id, c.title, c.summary, c.main_theme, c.status,
+             c.importance_score, c.growth_score, c.novelty_score,
+             c.source_diversity, c.article_count,
+             c.first_seen_at, c.last_updated_at, c.created_at,
+             (c.importance_score + c.growth_score * 10 + c.novelty_score * 15) AS score
+      FROM clusters c
+      WHERE c.status IN ('active', 'growing')
+        AND c.article_count <= ${maxMentions}
+        AND c.source_diversity >= ${minSources}
+        AND c.growth_score >= ${minGrowth}
+        AND c.first_seen_at > NOW() - INTERVAL '72 hours'
+      ORDER BY c.growth_score DESC, c.novelty_score DESC, c.importance_score DESC
+      LIMIT ${limit}
+    `),
+    rows<AnalysisRow>(sql`
+      SELECT id, target_type, target_id, model_provider, model_name,
+             analysis_type, content, tokens_used, cost_estimate, created_at
+      FROM ai_analyses
+      WHERE target_type = 'daily_digest'
+        AND target_id = 'weak_signals'
+        AND analysis_type = 'weak_signal'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `),
+  ]);
+
+  return json({
+    signals: clusters.map(normalizeCluster),
+    latest_llm_digest: weakSignalAnalyses[0] ? normalizeAnalysis(weakSignalAnalyses[0]) : null,
+    count: clusters.length,
+    source: 'neon',
+  });
+}

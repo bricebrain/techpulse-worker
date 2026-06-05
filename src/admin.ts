@@ -82,11 +82,11 @@ export function adminPage(): Response {
         <option value="youtube">YouTube</option>
         <option value="general">Développement</option>
         <option value="ai">IA & Data</option>
-        <option value="mobile">Mobile / Expo</option>
         <option value="business">Business</option>
         <option value="startups">Startups</option>
+        <option value="finance">Finance</option>
+        <option value="economy">Économie</option>
         <option value="opensource">Open Source</option>
-        <option value="productivity">Productivité</option>
       </select>
       <input id="search" type="search" placeholder="Filtrer…" oninput="renderTable()" style="flex:1;min-width:140px" />
     </div>
@@ -112,11 +112,11 @@ export function adminPage(): Response {
         <option value="youtube">YouTube</option>
         <option value="general">Développement</option>
         <option value="ai">IA & Data</option>
-        <option value="mobile">Mobile / Expo</option>
         <option value="business">Business</option>
         <option value="startups">Startups</option>
+        <option value="finance">Finance</option>
+        <option value="economy">Économie</option>
         <option value="opensource">Open Source</option>
-        <option value="productivity">Productivité</option>
       </select>
     </label>
     <label>Type
@@ -126,6 +126,7 @@ export function adminPage(): Response {
         <option value="reddit_rss">Reddit</option>
         <option value="devto_tag">Dev.to tag</option>
         <option value="hackernews_rss">Hacker News RSS</option>
+        <option value="grok_live">Grok Live Search</option>
       </select>
     </label>
     <label>Valeur (URL ou Channel ID)
@@ -145,6 +146,8 @@ export function adminPage(): Response {
   const BASE = window.location.origin;
   let secret = '';
   let allSources = [];
+  const valueInput = () => document.getElementById('mValue');
+  const typeInput = () => document.getElementById('mType');
 
   function setStatus(msg, ok) {
     const el = document.getElementById('status');
@@ -217,8 +220,8 @@ export function adminPage(): Response {
     const body = {
       name: document.getElementById('mName').value.trim(),
       theme: document.getElementById('mTheme').value,
-      type: document.getElementById('mType').value,
-      value: document.getElementById('mValue').value.trim(),
+      type: typeInput().value,
+      value: valueInput().value.trim(),
       limit_count: Number(document.getElementById('mLimit').value),
     };
     if (!body.name || !body.value) { setStatus('Nom et valeur requis', false); return; }
@@ -237,15 +240,32 @@ export function adminPage(): Response {
     setStatus(res.ok ? 'Cron lancé — articles disponibles dans ~30s' : 'Erreur cron', res.ok);
   }
 
+  function syncValuePlaceholder() {
+    const type = typeInput().value;
+    valueInput().placeholder =
+      type === 'grok_live'
+        ? 'Ex: latest developer tooling launches, cloud platform updates, browser platform changes'
+        : type === 'reddit_rss'
+          ? 'Ex: r/MachineLearning'
+          : type === 'devto_tag'
+            ? 'Ex: react'
+            : type === 'youtube_channel'
+              ? 'Ex: UCVHFbw7woebKtFFBqfpq6aA'
+              : 'Ex: https://example.com/feed.xml';
+  }
+
   function openModal() { document.getElementById('modalBg').classList.add('open'); }
   function closeModal() {
     document.getElementById('modalBg').classList.remove('open');
     ['mName','mValue'].forEach(id => document.getElementById(id).value = '');
     document.getElementById('mLimit').value = '5';
+    syncValuePlaceholder();
   }
 
+  document.getElementById('mType').addEventListener('change', syncValuePlaceholder);
   document.getElementById('secretInput').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
   document.getElementById('modalBg').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+  syncValuePlaceholder();
 </script>
 </body>
 </html>`;

@@ -7,18 +7,17 @@ import type { Env, Article } from './types';
 
 const MODEL = '@cf/meta/llama-3.2-3b-instruct';
 
-const VALID_THEMES = ['ai', 'mobile', 'general', 'business', 'startups', 'opensource', 'productivity', 'finance'] as const;
+const VALID_THEMES = ['ai', 'general', 'business', 'startups', 'opensource', 'finance', 'economy'] as const;
 type Theme = typeof VALID_THEMES[number];
 
 const THEME_DESCRIPTIONS: Record<Theme, string> = {
   ai:           'artificial intelligence, machine learning, LLMs, neural networks, GPT, ChatGPT, deep learning',
-  mobile:       'mobile development, iOS, Android, React Native, Expo, Swift, Kotlin, Flutter',
-  general:      'web development, programming, software engineering, DevOps, cloud, APIs, GitHub',
-  business:     'business strategy, venture capital, investment, tech industry news, mergers, acquisitions',
+  general:      'web development, programming, software engineering, DevOps, cloud, APIs, GitHub, React Native, Expo, iOS, Android',
+  business:     'business strategy, venture capital, B2B software, tech industry news, mergers, acquisitions',
   startups:     'startups, product launches, entrepreneurship, funding rounds, tech companies',
   opensource:   'open source, Linux, developer tools, libraries, frameworks, community projects',
-  productivity: 'productivity, time management, automation, workflows, tools, personal efficiency',
-  finance:      'stock markets, financial news, economy, trading, crypto, interest rates, earnings reports, IPO',
+  finance:      'stock markets, company earnings, fintech, trading, crypto markets, IPO, listed companies, asset managers',
+  economy:      'macroeconomics, inflation, central banks, interest rates, GDP, labor market, fiscal policy, financial regulation',
 };
 
 function buildPrompt(title: string, content: string): string {

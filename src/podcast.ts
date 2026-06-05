@@ -18,6 +18,7 @@
  */
 
 import type { Env } from './types';
+import { resolveSecrets } from './types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -141,13 +142,15 @@ async function callLLM(
   temperature: number,
   label: string,
 ): Promise<string | null> {
+  const { XAI_API_KEY, GROQ_API_KEY_1, GROQ_API_KEY_2, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY } = await resolveSecrets(env);
+
   // 1. xAI Grok (grok-4.3) — puissant, parfait pour les scripts longs
   // Utilise /v1/chat/completions (API OpenAI-compatible, pas Responses API)
-  if (env.XAI_API_KEY) {
+  if (XAI_API_KEY) {
     try {
       const res = await fetch('https://api.x.ai/v1/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${env.XAI_API_KEY}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${XAI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'grok-4.20-0309-non-reasoning', // non-reasoning : rapide pour les longs scripts JSON
           max_tokens: maxTokens,
@@ -172,7 +175,7 @@ async function callLLM(
   }
 
   // 2. Groq — rapide, quota élevé, quota isolé du proxy app
-  const groqKey = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+  const groqKey = GROQ_API_KEY_1 || GROQ_API_KEY_2;
   if (groqKey) {
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -201,11 +204,11 @@ async function callLLM(
   }
 
   // 2. DeepSeek-V3 — bon pour les longues sorties
-  if (env.DEEPSEEK_API_KEY) {
+  if (DEEPSEEK_API_KEY) {
     try {
       const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'deepseek-chat',
           max_tokens: maxTokens,
@@ -229,13 +232,13 @@ async function callLLM(
   }
 
   // 3. Gemini Flash (API OpenAI-compatible de Google)
-  if (env.GEMINI_API_KEY) {
+  if (GEMINI_API_KEY) {
     try {
       const res = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
         {
           method: 'POST',
-          headers: { Authorization: `Bearer ${env.GEMINI_API_KEY}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${GEMINI_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: 'gemini-2.0-flash',
             max_tokens: maxTokens,
@@ -261,12 +264,12 @@ async function callLLM(
   }
 
   // 4. OpenRouter (modèle gratuit llama-3.3-70b)
-  if (env.OPENROUTER_API_KEY) {
+  if (OPENROUTER_API_KEY) {
     try {
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json',
           'HTTP-Referer': 'https://techpulse-worker.bricebrain.workers.dev',
         },
@@ -301,7 +304,8 @@ async function generateDailyScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
+  const { GROQ_API_KEY_1, GROQ_API_KEY_2, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY } = await resolveSecrets(env);
+  if (!GROQ_API_KEY_1 && !GROQ_API_KEY_2 && !DEEPSEEK_API_KEY && !GEMINI_API_KEY && !OPENROUTER_API_KEY) {
     console.warn('[Podcast/daily] Aucun LLM disponible (Groq/DeepSeek/Gemini/OpenRouter)');
     return null;
   }
@@ -365,7 +369,8 @@ async function generateDeepDiveScript(
   articles: DbArticle[],
   env: Env,
 ): Promise<PodcastScript | null> {
-  if (!env.GROQ_API_KEY_1 && !env.GROQ_API_KEY_2 && !env.DEEPSEEK_API_KEY && !env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) {
+  const { GROQ_API_KEY_1, GROQ_API_KEY_2, DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY } = await resolveSecrets(env);
+  if (!GROQ_API_KEY_1 && !GROQ_API_KEY_2 && !DEEPSEEK_API_KEY && !GEMINI_API_KEY && !OPENROUTER_API_KEY) {
     console.warn('[Podcast/deep_dive] Aucun LLM disponible (Groq/DeepSeek/Gemini/OpenRouter)');
     return null;
   }
@@ -459,14 +464,15 @@ async function synthesizeViaOpenAI(
   segment: PodcastSegment,
   env: Env,
 ): Promise<ArrayBuffer | null> {
-  if (!env.OPENAI_API_KEY) return null;
+  const { OPENAI_API_KEY } = await resolveSecrets(env);
+  if (!OPENAI_API_KEY) return null;
 
   const config = VOICES[segment.speaker];
   try {
     const res = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -626,8 +632,9 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
     return;
   }
 
+  const { OPENAI_API_KEY: openaiKeyDaily } = await resolveSecrets(env);
   const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
-  const hasOpenAI  = !!env.OPENAI_API_KEY;
+  const hasOpenAI  = !!openaiKeyDaily;
   if (!hasFastApi && !hasOpenAI) {
     console.warn('[Podcast] Aucun provider TTS disponible (ni FastAPI/HF ni OpenAI) — abandon');
     return;
@@ -680,8 +687,9 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
     return;
   }
 
+  const { OPENAI_API_KEY: openaiKeyDeepDive } = await resolveSecrets(env);
   const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
-  const hasOpenAI  = !!env.OPENAI_API_KEY;
+  const hasOpenAI  = !!openaiKeyDeepDive;
   if (!hasFastApi && !hasOpenAI) {
     console.warn('[Podcast] Aucun provider TTS disponible — abandon');
     return;

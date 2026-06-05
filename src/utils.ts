@@ -24,7 +24,7 @@ export function err(message: string, status = 400): Response {
 
 /** Vérifie le header Authorization: Bearer <API_SECRET> */
 export function isAuthorized(req: Request, secret?: string): boolean {
-  if (!secret) return true; // pas de secret configuré → ouvert
+  if (!secret) return false; // secret absent → routes privées fermées par défaut
   const auth = req.headers.get('Authorization') ?? '';
   return auth === `Bearer ${secret}`;
 }

@@ -9,6 +9,7 @@
  */
 
 import type { Env } from './types';
+import { resolveSecrets } from './types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -102,7 +103,8 @@ async function getContext(env: Env): Promise<{
 // ─── Appel Groq ───────────────────────────────────────────────────────────────
 
 async function callGroq(prompt: string, env: Env): Promise<string | null> {
-  const key = env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2;
+  const { GROQ_API_KEY_1, GROQ_API_KEY_2 } = await resolveSecrets(env);
+  const key = GROQ_API_KEY_1 || GROQ_API_KEY_2;
   if (!key) return null;
 
   try {
