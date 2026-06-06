@@ -126,7 +126,11 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
             FROM cluster_articles ca
             JOIN articles a ON a.id = ca.article_id
             WHERE ca.cluster_id = c.id
-              AND CONCAT_WS(' ', c.title, a.title, a.description) ~* '(ai|artificial intelligence|data center|spacex|openai|microsoft|nvidia|alphabet|google|anthropic|ipo|startup|cloud|cyber|security|hack|semiconductor|chip|energy|nuclear|regulat|finance|market|trade|compute|rocket|satellite)'
+              AND (
+                CONCAT_WS(' ', c.title, a.title, a.description) ~* '(^|[^[:alnum:]_])(ai|ipo)([^[:alnum:]_]|$)'
+                OR CONCAT_WS(' ', c.title, a.title, a.description) ~* '(artificial intelligence|data centers?|spacex|openai|microsoft|nvidia|alphabet|google|anthropic|cloud|cyber|security|hack|semiconductor|chip|nuclear|regulat|finance|market|trade|compute|rocket|satellite|payments?|fintech)'
+              )
+              AND CONCAT_WS(' ', c.title, a.title, a.description) !~* '(grand theft auto|final fantasy|video games?|summer game fest|multiplayer sequel|remake trilogy)'
               AND (
                 LOWER(COALESCE(a.source_name, '')) <> 'hacker news'
                 OR COALESCE(a.external_score, 0) >= 10
