@@ -93,7 +93,7 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
              c.importance_score
              + LEAST(c.growth_score, 20) * 2
              + c.novelty_score * 2
-             + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+             + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
            ) AS score,
            COALESCE((
              SELECT jsonb_agg(article_preview ORDER BY article_preview.published_at DESC NULLS LAST)
@@ -119,6 +119,21 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
     WHERE c.status IN ('active', 'growing', 'peak')
       AND (
         c.article_count >= 2
+        OR (
+          (c.importance_score >= 8 OR c.growth_score >= 10)
+          AND EXISTS (
+            SELECT 1
+            FROM cluster_articles ca
+            JOIN articles a ON a.id = ca.article_id
+            WHERE ca.cluster_id = c.id
+              AND CONCAT_WS(' ', c.title, a.title, a.description) ~* '(ai|artificial intelligence|data center|spacex|openai|microsoft|nvidia|alphabet|google|anthropic|ipo|startup|cloud|cyber|security|hack|semiconductor|chip|energy|nuclear|regulat|finance|market|trade|compute|rocket|satellite)'
+              AND (
+                LOWER(COALESCE(a.source_name, '')) <> 'hacker news'
+                OR COALESCE(a.external_score, 0) >= 10
+                OR COALESCE(a.comments_count, 0) >= 5
+              )
+          )
+        )
         OR EXISTS (
           SELECT 1 FROM ai_analyses aa
           WHERE aa.target_type = 'cluster' AND aa.target_id = c.id
@@ -153,7 +168,7 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
              c.importance_score
              + LEAST(c.growth_score, 20) * 2
              + c.novelty_score * 2
-             + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+             + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
            ) AS score
     FROM clusters c
     WHERE c.id = ${clusterId}
@@ -236,7 +251,7 @@ async function getEntities(sql: Sql, url: URL): Promise<Response> {
       'ai', 'us', 'u.s.', 'u. s.', 'uk', 'reuters', 'bloomberg',
       'bloomberg tech', 'bloomberg technology', 'hacker news',
       'techcrunch', 'the verge', 'ars technica', 'cnbc',
-      'ed ludlow', 'caroline hyde'
+      'ed ludlow', 'caroline hyde', 'youtube', 'san francisco'
     )
     GROUP BY e.id
     ORDER BY e.trend_score DESC, e.mentions_count DESC, e.last_seen_at DESC NULLS LAST
@@ -269,7 +284,7 @@ async function getSignals(sql: Sql, url: URL): Promise<Response> {
                c.importance_score
                + LEAST(c.growth_score, 20) * 2
                + c.novelty_score * 2
-               + CASE WHEN c.article_count >= 2 THEN 20 ELSE 0 END
+               + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
              ) AS score
       FROM clusters c
       WHERE c.status IN ('active', 'growing')
