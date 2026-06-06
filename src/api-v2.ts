@@ -117,6 +117,13 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
            ) AS analysis_preview
     FROM clusters c
     WHERE c.status IN ('active', 'growing', 'peak')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM cluster_articles ca_scope
+        JOIN articles a_scope ON a_scope.id = ca_scope.article_id
+        WHERE ca_scope.cluster_id = c.id
+          AND CONCAT_WS(' ', c.title, a_scope.title, a_scope.description) ~* '(grand theft auto|final fantasy|video games?|summer game fest|multiplayer sequel|remake trilogy|entertainment/games)'
+      )
       AND (
         c.article_count >= 2
         OR (
