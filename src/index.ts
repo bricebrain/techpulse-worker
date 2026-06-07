@@ -8,6 +8,7 @@ import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
 import { handleApiV2 } from './api-v2';
+import { getNeonAdminStatus } from './neon-admin';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -1278,6 +1279,12 @@ export default {
         },
         devices: devices?.n ?? 0,
       });
+    }
+
+    // ── GET /admin/neon-status — monitoring Neon + pipelines GitHub Actions ─
+    if (method === 'GET' && path === '/admin/neon-status') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      return getNeonAdminStatus(env);
     }
 
     return err('Route inconnue', 404);
