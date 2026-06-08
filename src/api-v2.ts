@@ -388,6 +388,20 @@ async function getEntityGraph(sql: Sql, entityId: string, url: URL): Promise<Res
 
   if (!entity) return err('Entité introuvable', 404);
 
+  const [relationshipTable] = await rows<{ exists: boolean }>(sql`
+    SELECT to_regclass('public.entity_relationships') IS NOT NULL AS exists
+  `);
+
+  if (!relationshipTable?.exists) {
+    return json({
+      entity: normalizeEntity(entity),
+      relationships: [],
+      count: 0,
+      source: 'neon',
+      warning: 'entity_relationships table missing',
+    });
+  }
+
   const relationships = await rows<EntityRelationshipRow>(sql`
     SELECT
       er.id,
