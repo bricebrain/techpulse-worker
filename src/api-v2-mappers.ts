@@ -1,4 +1,4 @@
-import type { AnalysisRow, ArticleRow, ClusterRow, EntityRow } from './api-v2-types';
+import type { AnalysisRow, ArticleDetailRow, ArticleIntelligenceRow, ArticleRow, ClusterRow, EntityRow } from './api-v2-types';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -55,6 +55,71 @@ export function normalizeArticle(row: ArticleRow): JsonRecord {
     fetched_at: toIso(row.fetched_at),
     cluster_role: row.role,
     similarity_score: parseNumber(row.similarity_score),
+  };
+}
+
+export function normalizeArticleDetail(row: ArticleDetailRow): JsonRecord {
+  return {
+    ...normalizeArticle(row),
+    full_text: row.full_text,
+    status: row.status,
+    pipeline_status: row.pipeline_status,
+    extraction_status: row.extraction_status,
+    embedding_status: row.embedding_status,
+    clustering_status: row.clustering_status,
+    analysis_status: row.analysis_status,
+    llm_enrichment_status: row.llm_enrichment_status,
+    llm_enriched_at: toIso(row.llm_enriched_at),
+    llm_enrichment_model: row.llm_enrichment_model,
+    extraction_method: row.extraction_method,
+    extracted_at: toIso(row.extracted_at),
+    embedded_at: toIso(row.embedded_at),
+    embedding_model: row.embedding_model,
+    embedding_dimensions: parseNumber(row.embedding_dimensions),
+    internal_score: parseNumber(row.internal_score),
+    created_at: toIso(row.created_at),
+  };
+}
+
+export function normalizeArticleIntelligence(row: ArticleIntelligenceRow): JsonRecord {
+  return {
+    id: row.id,
+    article_id: row.article_id,
+    model_provider: row.model_provider,
+    model_name: row.model_name,
+    language: row.language,
+    canonical_title: row.canonical_title,
+    summary: row.summary,
+    article_type: row.article_type,
+    primary_domain: row.primary_domain,
+    topic: row.topic,
+    subtopics: asArray(row.subtopics),
+    event_fingerprint: row.event_fingerprint,
+    event_date: toIso(row.event_date),
+    entities: asArray(row.entities),
+    companies: asArray(row.companies),
+    people: asArray(row.people),
+    products: asArray(row.products),
+    sectors: asArray(row.sectors),
+    countries: asArray(row.countries),
+    keywords: asArray(row.keywords),
+    tags: asArray(row.tags),
+    sentiment: row.sentiment,
+    sentiment_score: parseNumber(row.sentiment_score),
+    tech_impact: row.tech_impact,
+    business_impact: row.business_impact,
+    finance_impact: row.finance_impact,
+    market_impact: row.market_impact,
+    quality_score: parseNumber(row.quality_score),
+    relevance_score: parseNumber(row.relevance_score),
+    novelty_score: parseNumber(row.novelty_score),
+    time_sensitivity: row.time_sensitivity,
+    should_cluster: row.should_cluster,
+    cluster_hint: row.cluster_hint,
+    confidence: parseNumber(row.confidence),
+    raw: row.raw ?? {},
+    created_at: toIso(row.created_at),
+    updated_at: toIso(row.updated_at),
   };
 }
 

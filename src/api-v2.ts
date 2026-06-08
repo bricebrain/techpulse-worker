@@ -4,6 +4,8 @@ import {
   asArray,
   normalizeAnalysis,
   normalizeArticle,
+  normalizeArticleDetail,
+  normalizeArticleIntelligence,
   normalizeCluster,
   normalizeEntity,
   parseNumber,
@@ -11,6 +13,8 @@ import {
 } from './api-v2-mappers';
 import type {
   AnalysisRow,
+  ArticleDetailRow,
+  ArticleIntelligenceRow,
   ArticleRow,
   ClusterRow,
   EntityRow,
@@ -59,6 +63,12 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
       const id = decodeURIComponent(path.slice('/api/v2/cluster/'.length)).trim();
       if (!id) return err('ID cluster requis');
       return getClusterDetail(sql, id);
+    }
+
+    if (path.startsWith('/api/v2/article/')) {
+      const id = decodeURIComponent(path.slice('/api/v2/article/'.length)).trim();
+      if (!id) return err('ID article requis');
+      return getArticleDetail(sql, id);
     }
 
     if (path === '/api/v2/entities') {
@@ -243,6 +253,84 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
       importance: parseNumber(event.importance),
       source_article_id: event.source_article_id,
     })),
+    source: 'neon',
+  });
+}
+
+async function getArticleDetail(sql: Sql, articleId: string): Promise<Response> {
+  const [article] = await rows<ArticleDetailRow>(sql`
+    SELECT a.id, a.title, a.description, a.full_text, a.source_name, a.source_type,
+           a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
+           a.external_score, a.comments_count, a.published_at, a.fetched_at,
+           a.status, a.pipeline_status, a.extraction_status, a.embedding_status,
+           a.clustering_status, a.analysis_status, a.llm_enrichment_status,
+           a.llm_enriched_at, a.llm_enrichment_model, a.extraction_method,
+           a.extracted_at, a.embedded_at, a.embedding_model, a.embedding_dimensions,
+           a.internal_score, a.created_at,
+           NULL::text AS role, NULL::float AS similarity_score
+    FROM articles a
+    WHERE a.id = ${articleId}
+    LIMIT 1
+  `);
+
+  if (!article) return err('Article introuvable', 404);
+
+  const [intelligence, clusters, entities] = await Promise.all([
+    rows<ArticleIntelligenceRow>(sql`
+      SELECT id, article_id, model_provider, model_name, language,
+             canonical_title, summary, article_type, primary_domain, topic,
+             subtopics, event_fingerprint, event_date, entities, companies,
+             people, products, sectors, countries, keywords, tags, sentiment,
+             sentiment_score, tech_impact, business_impact, finance_impact,
+             market_impact, quality_score, relevance_score, novelty_score,
+             time_sensitivity, should_cluster, cluster_hint, confidence, raw,
+             created_at, updated_at
+      FROM article_intelligence
+      WHERE article_id = ${articleId}
+      ORDER BY updated_at DESC NULLS LAST
+      LIMIT 1
+    `),
+    rows<ClusterRow>(sql`
+      SELECT c.id, c.title, c.summary, c.main_theme, c.status,
+             c.importance_score, c.growth_score, c.novelty_score,
+             (
+               SELECT COUNT(DISTINCT a.source_name)
+               FROM cluster_articles ca2
+               JOIN articles a ON a.id = ca2.article_id
+               WHERE ca2.cluster_id = c.id
+             ) AS source_diversity,
+             c.article_count,
+             c.first_seen_at, c.last_updated_at, c.created_at,
+             (
+               c.importance_score
+               + LEAST(c.growth_score, 20) * 2
+               + c.novelty_score * 2
+               + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
+             ) AS score
+      FROM clusters c
+      JOIN cluster_articles ca ON ca.cluster_id = c.id
+      WHERE ca.article_id = ${articleId}
+      ORDER BY ca.similarity_score DESC NULLS LAST, c.importance_score DESC
+      LIMIT 5
+    `),
+    rows<EntityRow>(sql`
+      SELECT e.id, e.name, e.normalized_name, e.type, e.description,
+             e.mentions_count, e.trend_score, e.first_seen_at, e.last_seen_at,
+             0 AS latest_growth_rate, 0 AS seven_day_mentions, 0 AS seven_day_sources
+      FROM entities e
+      JOIN article_entities ae ON ae.entity_id = e.id
+      WHERE ae.article_id = ${articleId}
+      GROUP BY e.id
+      ORDER BY e.trend_score DESC, e.mentions_count DESC
+      LIMIT 30
+    `),
+  ]);
+
+  return json({
+    article: normalizeArticleDetail(article),
+    intelligence: intelligence[0] ? normalizeArticleIntelligence(intelligence[0]) : null,
+    clusters: clusters.map(normalizeCluster),
+    entities: entities.map(normalizeEntity),
     source: 'neon',
   });
 }
