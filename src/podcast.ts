@@ -2,16 +2,16 @@
  * Génération automatique de podcasts côté serveur.
  *
  * Deux formats :
- *   1. TechBrief quotidien (vulgarisé) — 3 articles, ~10-12 min
+ *   1. TechBrief quotidien (vulgarisé) — 3 articles, ~7-9 min
  *      Segments : intro → (headline + context + explanation + impact + transition) × 3 → outro
  *
- *   2. Deep Dive hebdomadaire (vendredi) — 1 sujet, ~18-20 min
+ *   2. Deep Dive hebdomadaire (vendredi) — 1 sujet, ~14-16 min
  *      Segments : intro → large_context → explanation → analogie → analysis → impact → future → conclusion
  *
  * Flux commun :
  *   1. Fetch des meilleurs articles D1
  *   2. Script JSON via Groq (llama-3.3-70b)
- *   3. TTS segment par segment via OpenAI gpt-4o-mini-tts
+ *   3. TTS segment par segment via RunPod Kokoro, puis fallbacks
  *   4. Upload MP3 dans R2  →  podcasts/{id}/{i}.mp3
  *   5. Sauvegarde métadonnées + segments_json dans D1
  *   6. Nettoyage des podcasts > 7 jours
@@ -97,6 +97,24 @@ const VALID_TYPES = new Set<string>([
   'large_context', 'analogie', 'analysis', 'future', 'conclusion',
 ]);
 
+function sanitizeForFrenchTts(value: string): string {
+  return value
+    .replace(/^\s*(bonjour|bonsoir|salut)\b[^.!?]*[.!?]\s*/i, '')
+    .replace(/^\s*(bienvenue|merci d['’]avoir écouté|merci de nous avoir écoutés)\b[^.!?]*[.!?]\s*/i, '')
+    .replace(/\bIA\b/g, 'intelligence artificielle')
+    .replace(/\bAI\b/g, 'intelligence artificielle')
+    .replace(/\bLLM\b/g, 'modèle de langage')
+    .replace(/\bGPU\b/g, 'processeur graphique')
+    .replace(/\bCPU\b/g, 'processeur')
+    .replace(/\bAPI\b/g, 'A P I')
+    .replace(/\bIPO\b/g, 'entrée en bourse')
+    .replace(/\bCEO\b/g, 'dirigeant')
+    .replace(/\bB2B\b/g, 'business to business')
+    .replace(/\bB2C\b/g, 'business to consumer')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function parseScript(raw: string, fallbackTitle: string): PodcastScript | null {
   try {
     const match = raw.match(/\{[\s\S]*\}/);
@@ -113,8 +131,8 @@ function parseScript(raw: string, fallbackTitle: string): PodcastScript | null {
       .map((s, i) => ({
         id: `seg_${i}`,
         type: (VALID_TYPES.has(s.type ?? '') ? s.type : 'analysis') as SegmentType,
-        speaker: (s.speaker === 'analyst' ? 'analyst' : 'host') as PodcastSegment['speaker'],
-        text: (s.text ?? '').trim(),
+        speaker: 'host',
+        text: sanitizeForFrenchTts(s.text ?? ''),
       }));
 
     if (segments.length < 3) return null;
@@ -298,7 +316,7 @@ async function callLLM(
   return null;
 }
 
-// ─── Script quotidien vulgarisé (3 articles, ~10-12 min) ─────────────────────
+// ─── Script quotidien vulgarisé (3 articles, ~7-9 min) ───────────────────────
 
 async function generateDailyScript(
   articles: DbArticle[],
@@ -322,28 +340,29 @@ async function generateDailyScript(
   const articleBlocks = top.map((_, i) => {
     const notLast = i < top.length - 1;
     return (
-      `    {"type":"headline","speaker":"host","text":"Annonce en 25-30 mots de l'article ${i + 1}, formulation percutante"},\n` +
-      `    {"type":"context","speaker":"analyst","text":"Contexte en 130-140 mots : ce que l'auditeur doit savoir en fond pour comprendre, 'Pour bien comprendre il faut savoir que...'"},\n` +
-      `    {"type":"explanation","speaker":"host","text":"Explication en 110-120 mots : ce que ça signifie concrètement, 'En clair, ça veut dire que...', 'Concrètement pour vous...'"},\n` +
-      `    {"type":"impact","speaker":"analyst","text":"Impact en 90-100 mots : pourquoi c'est important, qui est concerné, quelles conséquences pratiques"}` +
-      (notLast ? `,\n    {"type":"transition","speaker":"host","text":"Transition fluide en 25-30 mots vers le sujet suivant"}` : '')
+      `    {"type":"headline","speaker":"host","text":"Titre oral en 18-24 mots pour l'article ${i + 1}. Direct, précis, sans effet radio."},\n` +
+      `    {"type":"context","speaker":"host","text":"Contexte en 85-105 mots. Expliquer le décor, les acteurs et le problème. Phrases courtes."},\n` +
+      `    {"type":"explanation","speaker":"host","text":"Explication en 80-95 mots. Dire ce que cela change concrètement. Une analogie maximum."},\n` +
+      `    {"type":"impact","speaker":"host","text":"Impact en 65-80 mots. Pourquoi suivre ce signal, qui est touché, quel risque ou opportunité."}` +
+      (notLast ? `,\n    {"type":"transition","speaker":"host","text":"Transition sobre en 12-18 mots vers le sujet suivant. Pas de formule de radio."}` : '')
     );
   }).join(',\n');
 
   const prompt =
     `Voici ${top.length} articles tech du jour :\n\n${articleList}\n\n` +
-    `Génère un podcast de vulgarisation tech en français (~10-12 minutes) au format JSON EXACT :\n\n` +
+    `Génère une note audio TechPulse en français (~7-9 minutes) au format JSON EXACT :\n\n` +
     `{\n  "title": "TechBrief — ${todayFr()}",\n  "segments": [\n` +
-    `    {"type":"intro","speaker":"host","text":"Introduction chaleureuse en 70-80 mots : accueillir l'auditeur, présenter les 3 sujets du jour avec enthousiasme"},\n` +
+    `    {"type":"intro","speaker":"host","text":"Ouverture directe en 45-55 mots. Entrer immédiatement dans les 3 signaux. Interdit de dire bonjour, bienvenue, aujourd'hui au programme, merci."},\n` +
     `${articleBlocks},\n` +
-    `    {"type":"outro","speaker":"host","text":"Conclusion en 55-65 mots : récap des 3 points clés, formule de fin chaleureuse"}\n` +
+    `    {"type":"outro","speaker":"host","text":"Conclusion en 35-45 mots. Récapitulatif net des trois signaux. Pas de remerciement, pas d'appel à revenir."}\n` +
     `  ]\n}\n\n` +
     `RÈGLES :\n` +
-    `- Vulgarisation : accessible à quelqu'un sans background technique\n` +
-    `- context (analyst) : histoire, fond, "Tout a commencé quand...", "Il faut savoir que..."\n` +
-    `- explanation (host) : "Concrètement...", "En clair...", analogies simples du quotidien\n` +
-    `- impact (analyst) : chiffres, acteurs, conséquences réelles\n` +
-    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
+    `- Un seul narrateur. Toujours speaker="host". Ne jamais utiliser "analyst".\n` +
+    `- Ton premium, sobre, analytique. Pas d'animateur radio, pas d'humour forcé.\n` +
+    `- Interdit : "bonjour", "bienvenue", "merci d'avoir écouté", "on se retrouve", "installez-vous".\n` +
+    `- Écrire pour Kokoro TTS en français : phrases de 8 à 18 mots, ponctuation claire, peu d'anglicismes.\n` +
+    `- Déplier les acronymes : intelligence artificielle, processeur graphique, modèle de langage.\n` +
+    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral.`;
 
   const raw = await callLLM(
     env,
@@ -351,7 +370,7 @@ async function generateDailyScript(
       {
         role: 'system',
         content:
-          'Tu es un producteur de podcast tech francophone spécialisé en vulgarisation. Tu rends la tech accessible à tous. Tu réponds UNIQUEMENT en JSON valide.',
+          'Tu es un éditeur audio TechPulse. Tu écris une note de veille premium, concise, pédagogique, sans ton radio. Tu réponds UNIQUEMENT en JSON valide.',
       },
       { role: 'user', content: prompt },
     ],
@@ -363,7 +382,7 @@ async function generateDailyScript(
   return parseScript(raw, `TechBrief — ${todayFr()}`);
 }
 
-// ─── Script Deep Dive hebdomadaire (1 sujet, ~18-20 min) ─────────────────────
+// ─── Script Deep Dive hebdomadaire (1 sujet, ~14-16 min) ─────────────────────
 
 async function generateDeepDiveScript(
   articles: DbArticle[],
@@ -385,24 +404,24 @@ async function generateDeepDiveScript(
   const prompt =
     `Sujet du Deep Dive : "${article.title}" (${article.source_name})\n` +
     (content ? `Contenu disponible : ${content}\n` : '') +
-    `\nGénère un podcast Deep Dive pédagogique en français (~18-20 minutes) au format JSON EXACT :\n\n` +
+    `\nGénère une analyse audio Deep Dive en français (~14-16 minutes) au format JSON EXACT :\n\n` +
     `{\n  "title": "🔬 Deep Dive : ${shortTitle}",\n  "segments": [\n` +
-    `    {"type":"intro","speaker":"host","text":"Introduction percutante en 90-100 mots : accrocher l'auditeur dès la 1ère phrase, poser la question centrale, annoncer le voyage de compréhension"},\n` +
-    `    {"type":"large_context","speaker":"analyst","text":"Contexte historique et fondamentaux en 370-390 mots : d'où vient cette techno/tendance, son évolution sur 5-10 ans, les concepts de base, pourquoi ça existe, 'Tout a commencé...'"},\n` +
-    `    {"type":"explanation","speaker":"host","text":"Explication progressive en 290-310 mots : comment ça fonctionne vraiment, par étapes claires, du plus simple au plus complexe, sans jargon inutile"},\n` +
-    `    {"type":"analogie","speaker":"host","text":"Analogie du quotidien en 240-260 mots : DOIT commencer par 'Imaginez que...' ou 'C'est exactement comme si...', une comparaison concrète avec la vie de tous les jours pour ancrer la compréhension intuitive"},\n` +
-    `    {"type":"analysis","speaker":"analyst","text":"Analyse technique approfondie en 360-380 mots : les mécanismes clés, les acteurs principaux, les chiffres importants, les défis, les enjeux techniques réels"},\n` +
-    `    {"type":"impact","speaker":"analyst","text":"Impacts sectoriels en 280-300 mots : transformation de l'emploi, économie, société, quels secteurs sont disrupted, qui perd, qui gagne, exemples concrets"},\n` +
-    `    {"type":"future","speaker":"host","text":"Perspectives futures en 260-280 mots : dans 3 ans, dans 10 ans, les scénarios optimiste et pessimiste, 'D'ici 2027...', 'Le scénario qui se dessine...', les signaux faibles à surveiller"},\n` +
-    `    {"type":"conclusion","speaker":"host","text":"Synthèse en 110-130 mots : les 3 points essentiels à retenir, pourquoi continuer à suivre ce sujet, formule de fin qui donne envie de revenir"}\n` +
+    `    {"type":"intro","speaker":"host","text":"Ouverture en 70-85 mots. Poser immédiatement la question centrale. Pas de salutations."},\n` +
+    `    {"type":"large_context","speaker":"host","text":"Contexte et fondamentaux en 250-280 mots. Origine du sujet, acteurs, vocabulaire utile. Phrases courtes."},\n` +
+    `    {"type":"explanation","speaker":"host","text":"Explication progressive en 220-250 mots. Comment cela fonctionne, étape par étape, sans jargon inutile."},\n` +
+    `    {"type":"analogie","speaker":"host","text":"Analogie du quotidien en 150-180 mots. Commencer par 'Imaginez que...' ou 'C'est comme si...'."},\n` +
+    `    {"type":"analysis","speaker":"host","text":"Analyse approfondie en 260-300 mots. Mécanismes clés, chiffres, tensions, limites."},\n` +
+    `    {"type":"impact","speaker":"host","text":"Impacts sectoriels en 210-240 mots. Qui gagne, qui perd, effets économiques et sociaux."},\n` +
+    `    {"type":"future","speaker":"host","text":"Perspectives en 190-220 mots. Scénarios à 3 ans, risques, signaux faibles à suivre."},\n` +
+    `    {"type":"conclusion","speaker":"host","text":"Synthèse en 70-85 mots. Trois points à retenir. Pas de remerciement ni formule de fin radio."}\n` +
     `  ]\n}\n\n` +
     `RÈGLES ABSOLUES :\n` +
-    `- Pédagogie par couches : chaque segment construit sur le précédent\n` +
-    `- large_context : commencer dans le passé et progresser vers le présent\n` +
-    `- analogie : OBLIGATOIREMENT commencer par "Imaginez que..." ou "C'est exactement comme si..."\n` +
-    `- future : oser les projections concrètes avec des dates approximatives\n` +
-    `- Respecter les word counts pour atteindre 18-20 minutes de contenu total\n` +
-    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral`;
+    `- Un seul narrateur. Toujours speaker="host". Ne jamais utiliser "analyst".\n` +
+    `- Pédagogie par couches : chaque segment construit sur le précédent.\n` +
+    `- Style premium : clair, dense, posé. Pas d'accueil, pas de conclusion bavarde.\n` +
+    `- Écrire pour Kokoro TTS en français : phrases de 8 à 18 mots, ponctuation claire.\n` +
+    `- Déplier les acronymes et chiffres complexes pour la voix.\n` +
+    `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral.`;
 
   const raw = await callLLM(
     env,
@@ -410,7 +429,7 @@ async function generateDeepDiveScript(
       {
         role: 'system',
         content:
-          'Tu es un journaliste tech expert, pédagogue et passionné. Tu crées des contenus audio longs, approfondis et accessibles. Tu réponds UNIQUEMENT en JSON valide.',
+          'Tu es un analyste TechPulse senior. Tu écris une analyse audio premium, claire et pédagogique, sans ton radio. Tu réponds UNIQUEMENT en JSON valide.',
       },
       { role: 'user', content: prompt },
     ],
