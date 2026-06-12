@@ -63,6 +63,8 @@ export interface Env {
   HF_TOKEN?: string;
   REDDIT_PROXY_URL?: string;
   REDDIT_PROXY_SECRET?: string;
+  RUNPOD_API_KEY?: string;
+  RUNPOD_AI_ENDPOINT_ID?: string;
   NEON_DATABASE_URL?: string;
   PODCASTS?: R2Bucket;
 }

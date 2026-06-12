@@ -423,8 +423,78 @@ async function generateDeepDiveScript(
 }
 
 // ─── TTS segment par segment ──────────────────────────────────────────────────
-// Priorité : FastAPI → Parler-TTS HF (gratuit)
-// Fallback  : OpenAI gpt-4o-mini-tts (~$4/mois) si FastAPI indisponible
+// Priorité : RunPod Kokoro → FastAPI Edge-TTS → OpenAI gpt-4o-mini-tts
+
+function base64ToArrayBuffer(value: string): ArrayBuffer {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function synthesizeViaRunPod(
+  segment: PodcastSegment,
+  env: Env,
+): Promise<ArrayBuffer | null> {
+  if (!env.RUNPOD_API_KEY || !env.RUNPOD_AI_ENDPOINT_ID) return null;
+
+  try {
+    const res = await fetch(`https://api.runpod.ai/v2/${env.RUNPOD_AI_ENDPOINT_ID}/runsync`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        input: {
+          task: 'tts.kokoro',
+          text: segment.text,
+          speaker: segment.speaker,
+          lang_code: 'f',
+          format: 'mp3',
+          upload_to_r2: false,
+          return_base64: true,
+        },
+      }),
+      signal: AbortSignal.timeout(180_000),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Podcast] RunPod TTS ${segment.id} → ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json<{
+      status?: string;
+      output?: {
+        ok?: boolean;
+        error?: string;
+        output?: { audio_base64?: string };
+      };
+    }>();
+
+    if (data.status && data.status !== 'COMPLETED') {
+      console.warn(`[Podcast] RunPod TTS ${segment.id} status=${data.status}`);
+      return null;
+    }
+    if (!data.output?.ok) {
+      console.warn(`[Podcast] RunPod TTS ${segment.id} failed: ${data.output?.error ?? 'unknown error'}`);
+      return null;
+    }
+
+    const audioBase64 = data.output.output?.audio_base64;
+    if (!audioBase64) {
+      console.warn(`[Podcast] RunPod TTS ${segment.id} missing audio_base64`);
+      return null;
+    }
+    return base64ToArrayBuffer(audioBase64);
+  } catch (e) {
+    console.warn(`[Podcast] RunPod TTS exception ${segment.id}:`, e);
+    return null;
+  }
+}
 
 async function synthesizeViaFastApi(
   segment: PodcastSegment,
@@ -500,7 +570,12 @@ async function synthesizeSegment(
   segment: PodcastSegment,
   env: Env,
 ): Promise<{ buffer: ArrayBuffer; ext: 'mp3' | 'aac' } | null> {
-  // Priorité : Edge-TTS via FastAPI (gratuit, voix neurales FR)
+  const runpodAudio = await synthesizeViaRunPod(segment, env);
+  if (runpodAudio) {
+    console.log(`[Podcast] Segment ${segment.id} → RunPod Kokoro ✓`);
+    return { buffer: runpodAudio, ext: 'mp3' };
+  }
+
   const edgeAudio = await synthesizeViaFastApi(segment, env);
   if (edgeAudio) {
     console.log(`[Podcast] Segment ${segment.id} → Edge-TTS ✓`);
@@ -633,13 +708,14 @@ export async function generateDailyPodcast(env: Env): Promise<void> {
   }
 
   const { OPENAI_API_KEY: openaiKeyDaily } = await resolveSecrets(env);
+  const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
   const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
   const hasOpenAI  = !!openaiKeyDaily;
-  if (!hasFastApi && !hasOpenAI) {
-    console.warn('[Podcast] Aucun provider TTS disponible (ni FastAPI/HF ni OpenAI) — abandon');
+  if (!hasRunPod && !hasFastApi && !hasOpenAI) {
+    console.warn('[Podcast] Aucun provider TTS disponible (RunPod/FastAPI/OpenAI) — abandon');
     return;
   }
-  console.log(`[Podcast] TTS providers disponibles : ${[hasFastApi && 'Parler-HF', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
+  console.log(`[Podcast] TTS providers disponibles : ${[hasRunPod && 'RunPod-Kokoro', hasFastApi && 'Edge-TTS', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
 
   // Warm-up Render en parallèle : on pinge le vrai endpoint TTS (pas juste "/")
   // pour forcer le chargement complet d'edge-tts avant les segments réels.
@@ -688,9 +764,10 @@ export async function generateDeepDivePodcast(env: Env): Promise<void> {
   }
 
   const { OPENAI_API_KEY: openaiKeyDeepDive } = await resolveSecrets(env);
+  const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
   const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
   const hasOpenAI  = !!openaiKeyDeepDive;
-  if (!hasFastApi && !hasOpenAI) {
+  if (!hasRunPod && !hasFastApi && !hasOpenAI) {
     console.warn('[Podcast] Aucun provider TTS disponible — abandon');
     return;
   }
