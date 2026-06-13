@@ -24,9 +24,14 @@ import type {
   TimelineEventRow,
 } from './api-v2-types';
 import type { Env } from './types';
+import { getArticleFeedbackPreferenceProfile, scorePreferenceAdjustment } from './feedback';
 import { err, json } from './utils';
 
 type Sql = NeonQueryFunction<false, false>;
+type PersonalizedFeedCluster = Record<string, unknown> & {
+  score: number;
+  last_updated_at?: unknown;
+};
 
 function getSql(env: Env): Sql | Response {
   if (!env.NEON_DATABASE_URL) {
@@ -58,7 +63,11 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
 
   try {
     if (path === '/api/v2/feed') {
-      return getFeed(sql, url);
+      return getFeed(sql, env, url);
+    }
+
+    if (path === '/api/v2/preferences') {
+      return getPreferences(env);
     }
 
     if (path.startsWith('/api/v2/cluster/')) {
@@ -95,8 +104,28 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
   }
 }
 
-async function getFeed(sql: Sql, url: URL): Promise<Response> {
+function getPreviewArticleSources(previewArticles: unknown[]): string[] {
+  return previewArticles
+    .map((article) => {
+      if (!article || typeof article !== 'object') return '';
+      const source = (article as { source_name?: unknown }).source_name;
+      return typeof source === 'string' ? source : '';
+    })
+    .filter(Boolean);
+}
+
+async function getPreferences(env: Env): Promise<Response> {
+  const profile = await getArticleFeedbackPreferenceProfile(env);
+  return json({
+    profile,
+    source: 'd1',
+  });
+}
+
+async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
   const limit = parseLimit(url, 30, 100);
+  const candidateLimit = Math.min(200, Math.max(limit * 3, limit));
+  const preferenceProfile = await getArticleFeedbackPreferenceProfile(env);
   const result = await rows<FeedClusterRow>(sql`
     SELECT c.id, c.title, c.summary, c.main_theme, c.status,
            c.importance_score, c.growth_score, c.novelty_score,
@@ -170,16 +199,49 @@ async function getFeed(sql: Sql, url: URL): Promise<Response> {
         )
       )
     ORDER BY score DESC, c.last_updated_at DESC NULLS LAST
-    LIMIT ${limit}
+    LIMIT ${candidateLimit}
   `);
 
-  const clusters = result.map((row) => ({
-    ...normalizeCluster(row),
-    preview_articles: asArray(row.preview_articles),
-    analysis_preview: row.analysis_preview ?? null,
-  }));
+  const clusters: PersonalizedFeedCluster[] = result
+    .map((row) => {
+      const normalized = normalizeCluster(row);
+      const previewArticles = asArray(row.preview_articles);
+      const preference = scorePreferenceAdjustment({
+        sourceNames: getPreviewArticleSources(previewArticles),
+        title: typeof normalized.title === 'string' ? normalized.title : '',
+        summary: typeof normalized.summary === 'string' ? normalized.summary : null,
+        profile: preferenceProfile,
+      });
+      const baseScore = parseNumber(row.score);
 
-  return json({ clusters, count: clusters.length, source: 'neon' });
+      return {
+        ...normalized,
+        score: baseScore + preference.delta,
+        base_score: baseScore,
+        preference_adjustment: preference.delta,
+        preference_reasons: preference.reasons,
+        preview_articles: previewArticles,
+        analysis_preview: row.analysis_preview ?? null,
+      };
+    })
+    .sort((left: PersonalizedFeedCluster, right: PersonalizedFeedCluster) => {
+      const byScore = parseNumber(right.score) - parseNumber(left.score);
+      if (byScore !== 0) return byScore;
+      const leftDate = typeof left.last_updated_at === 'string' ? Date.parse(left.last_updated_at) : 0;
+      const rightDate = typeof right.last_updated_at === 'string' ? Date.parse(right.last_updated_at) : 0;
+      return rightDate - leftDate;
+    })
+    .slice(0, limit);
+
+  return json({
+    clusters,
+    count: clusters.length,
+    source: 'neon',
+    personalization: {
+      enabled: preferenceProfile.total > 0,
+      feedback_count: preferenceProfile.total,
+    },
+  });
 }
 
 async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> {
