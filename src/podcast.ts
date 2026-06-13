@@ -41,6 +41,13 @@ interface PodcastScript {
   segments: PodcastSegment[];
 }
 
+export interface PodcastGenerationResult {
+  status: 'generated' | 'skipped' | 'failed';
+  reason?: string;
+  podcastId?: string | null;
+  title?: string;
+}
+
 interface DbArticle {
   title: string;
   source_name: string;
@@ -96,6 +103,60 @@ const VALID_TYPES = new Set<string>([
   'transition', 'outro',
   'large_context', 'analogie', 'analysis', 'future', 'conclusion',
 ]);
+
+const PODCAST_LOCK_KEY = 'podcast_generation';
+const PODCAST_LOCK_TTL_MS = 45 * 60 * 1000;
+
+async function ensureRuntimeLocksTable(env: Env): Promise<void> {
+  await env.DB.exec(`
+    CREATE TABLE IF NOT EXISTS runtime_locks (
+      key        TEXT PRIMARY KEY,
+      owner      TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at);
+  `);
+}
+
+async function acquireRuntimeLock(
+  env: Env,
+  key: string,
+  ttlMs: number,
+): Promise<{ acquired: boolean; owner: string; expiresAt: number }> {
+  await ensureRuntimeLocksTable(env);
+
+  const now = Date.now();
+  const owner = `${key}_${now}_${Math.random().toString(36).slice(2, 8)}`;
+  const expiresAt = now + ttlMs;
+  const updatedAt = new Date(now).toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO runtime_locks (key, owner, expires_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       owner = excluded.owner,
+       expires_at = excluded.expires_at,
+       updated_at = excluded.updated_at
+     WHERE runtime_locks.expires_at < ?`,
+  ).bind(key, owner, expiresAt, updatedAt, now).run();
+
+  const current = await env.DB.prepare(
+    'SELECT owner, expires_at FROM runtime_locks WHERE key = ?',
+  ).bind(key).first<{ owner: string; expires_at: number }>();
+
+  return {
+    acquired: current?.owner === owner,
+    owner,
+    expiresAt: current?.expires_at ?? expiresAt,
+  };
+}
+
+async function releaseRuntimeLock(env: Env, key: string, owner: string): Promise<void> {
+  await env.DB.prepare(
+    'DELETE FROM runtime_locks WHERE key = ? AND owner = ?',
+  ).bind(key, owner).run();
+}
 
 function sanitizeForFrenchTts(value: string): string {
   return value
@@ -715,111 +776,141 @@ async function notifyPodcastReady(env: Env, title: string, format: 'daily' | 'de
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 /**
- * TechBrief quotidien vulgarisé — ~10-12 min, 3 articles.
+ * TechBrief quotidien vulgarisé — ~7-9 min, 3 articles.
  * Cron : 0 6 * * * (chaque jour à 6h UTC)
  */
-export async function generateDailyPodcast(env: Env): Promise<void> {
+export async function generateDailyPodcast(env: Env): Promise<PodcastGenerationResult> {
   console.log('[Podcast] Démarrage TechBrief quotidien…');
 
-  if (!env.PODCASTS) {
-    console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
-    return;
+  const lock = await acquireRuntimeLock(env, PODCAST_LOCK_KEY, PODCAST_LOCK_TTL_MS);
+  if (!lock.acquired) {
+    const waitMin = Math.max(1, Math.ceil((lock.expiresAt - Date.now()) / 60000));
+    console.warn(`[Podcast] Génération déjà en cours — TechBrief ignoré (expiration dans ~${waitMin} min)`);
+    return { status: 'skipped', reason: 'podcast_generation_already_running' };
   }
 
-  const { OPENAI_API_KEY: openaiKeyDaily } = await resolveSecrets(env);
-  const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
-  const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
-  const hasOpenAI  = !!openaiKeyDaily;
-  if (!hasRunPod && !hasFastApi && !hasOpenAI) {
-    console.warn('[Podcast] Aucun provider TTS disponible (RunPod/FastAPI/OpenAI) — abandon');
-    return;
-  }
-  console.log(`[Podcast] TTS providers disponibles : ${[hasRunPod && 'RunPod-Kokoro', hasFastApi && 'Edge-TTS', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
+  try {
+    if (!env.PODCASTS) {
+      console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
+      return { status: 'failed', reason: 'missing_r2_bucket' };
+    }
 
-  // Warm-up Render en parallèle : on pinge le vrai endpoint TTS (pas juste "/")
-  // pour forcer le chargement complet d'edge-tts avant les segments réels.
-  // Free tier cold start = 60-120s ; le LLM prend ~20-40s → on part en même temps.
-  if (hasFastApi) {
-    const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
-    fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
-      signal: AbortSignal.timeout(120_000),
-    })
-      .then((r) => console.log(`[Podcast] FastAPI warm-up TTS ✓ (${r.status})`))
-      .catch(() => console.warn('[Podcast] FastAPI warm-up TTS timeout — fallback OpenAI probable'));
-  }
+    const { OPENAI_API_KEY: openaiKeyDaily } = await resolveSecrets(env);
+    const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
+    const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
+    const hasOpenAI = !!openaiKeyDaily;
+    if (!hasRunPod && !hasFastApi && !hasOpenAI) {
+      console.warn('[Podcast] Aucun provider TTS disponible (RunPod/FastAPI/OpenAI) — abandon');
+      return { status: 'failed', reason: 'missing_tts_provider' };
+    }
+    console.log(`[Podcast] TTS providers disponibles : ${[hasRunPod && 'RunPod-Kokoro', hasFastApi && 'Edge-TTS', hasOpenAI && 'OpenAI'].filter(Boolean).join(', ')}`);
 
-  const articles = await fetchTopArticles(env, 20, 24);
-  if (articles.length < 3) {
-    console.log(`[Podcast] Seulement ${articles.length} articles frais — TechBrief annulé`);
-    return;
-  }
-  console.log(`[Podcast/daily] ${articles.length} articles disponibles`);
+    // Warm-up Render en parallèle : on pinge le vrai endpoint TTS (pas juste "/")
+    // pour forcer le chargement complet d'edge-tts avant les segments réels.
+    // Free tier cold start = 60-120s ; le LLM prend ~20-40s → on part en même temps.
+    if (hasFastApi) {
+      const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
+      fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
+        signal: AbortSignal.timeout(120_000),
+      })
+        .then((r) => console.log(`[Podcast] FastAPI warm-up TTS ✓ (${r.status})`))
+        .catch(() => console.warn('[Podcast] FastAPI warm-up TTS timeout — fallback OpenAI probable'));
+    }
 
-  const script = await generateDailyScript(articles, env);
-  if (!script) {
-    console.warn('[Podcast/daily] Échec génération script');
-    return;
-  }
-  console.log(`[Podcast/daily] Script OK : "${script.title}" (${script.segments.length} segments)`);
+    const articles = await fetchTopArticles(env, 20, 24);
+    if (articles.length < 3) {
+      console.log(`[Podcast] Seulement ${articles.length} articles frais — TechBrief annulé`);
+      return { status: 'skipped', reason: 'not_enough_fresh_articles' };
+    }
+    console.log(`[Podcast/daily] ${articles.length} articles disponibles`);
 
-  await uploadAndSave(script, 'daily', env);
-  await notifyPodcastReady(env, script.title, 'daily');
-  await cleanupOldPodcasts(env);
+    const script = await generateDailyScript(articles, env);
+    if (!script) {
+      console.warn('[Podcast/daily] Échec génération script');
+      return { status: 'failed', reason: 'script_generation_failed' };
+    }
+    console.log(`[Podcast/daily] Script OK : "${script.title}" (${script.segments.length} segments)`);
+
+    const podcastId = await uploadAndSave(script, 'daily', env);
+    if (!podcastId) {
+      return { status: 'failed', reason: 'audio_upload_failed' };
+    }
+    await notifyPodcastReady(env, script.title, 'daily');
+    await cleanupOldPodcasts(env);
+    return { status: 'generated', podcastId, title: script.title };
+  } finally {
+    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner);
+  }
 }
 
 /**
- * Deep Dive hebdomadaire pédagogique — ~18-20 min, 1 sujet approfondi.
+ * Deep Dive hebdomadaire pédagogique — ~14-16 min, 1 sujet approfondi.
  * Cron : 0 6 * * 5 (vendredi à 6h UTC)
  */
-export async function generateDeepDivePodcast(env: Env): Promise<void> {
+export async function generateDeepDivePodcast(env: Env): Promise<PodcastGenerationResult> {
   console.log('[Podcast] Démarrage Deep Dive hebdomadaire…');
 
-  if (!env.PODCASTS) {
-    console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
-    return;
+  const lock = await acquireRuntimeLock(env, PODCAST_LOCK_KEY, PODCAST_LOCK_TTL_MS);
+  if (!lock.acquired) {
+    const waitMin = Math.max(1, Math.ceil((lock.expiresAt - Date.now()) / 60000));
+    console.warn(`[Podcast] Génération déjà en cours — Deep Dive ignoré (expiration dans ~${waitMin} min)`);
+    return { status: 'skipped', reason: 'podcast_generation_already_running' };
   }
 
-  const { OPENAI_API_KEY: openaiKeyDeepDive } = await resolveSecrets(env);
-  const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
-  const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
-  const hasOpenAI  = !!openaiKeyDeepDive;
-  if (!hasRunPod && !hasFastApi && !hasOpenAI) {
-    console.warn('[Podcast] Aucun provider TTS disponible — abandon');
-    return;
-  }
+  try {
+    if (!env.PODCASTS) {
+      console.warn('[Podcast] R2 bucket PODCASTS non configuré — abandon');
+      return { status: 'failed', reason: 'missing_r2_bucket' };
+    }
 
-  // Warm-up Render : pinger le vrai endpoint TTS pour forcer le chargement d'edge-tts
-  if (hasFastApi) {
-    const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
-    fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
-      signal: AbortSignal.timeout(120_000),
-    })
-      .then((r) => console.log(`[Podcast/deep_dive] FastAPI warm-up TTS ✓ (${r.status})`))
-      .catch(() => console.warn('[Podcast/deep_dive] FastAPI warm-up TTS timeout'));
-  }
+    const { OPENAI_API_KEY: openaiKeyDeepDive } = await resolveSecrets(env);
+    const hasRunPod = !!(env.RUNPOD_API_KEY && env.RUNPOD_AI_ENDPOINT_ID);
+    const hasFastApi = !!(env.REDDIT_PROXY_URL && env.REDDIT_PROXY_SECRET);
+    const hasOpenAI = !!openaiKeyDeepDive;
+    if (!hasRunPod && !hasFastApi && !hasOpenAI) {
+      console.warn('[Podcast] Aucun provider TTS disponible — abandon');
+      return { status: 'failed', reason: 'missing_tts_provider' };
+    }
 
-  // Articles de la semaine pour choisir le sujet le plus riche
-  const articles = await fetchTopArticles(env, 50, 7 * 24);
-  if (articles.length < 1) {
-    console.log('[Podcast] Aucun article cette semaine — Deep Dive annulé');
-    return;
-  }
-  console.log(`[Podcast/deep_dive] ${articles.length} articles candidats`);
+    // Warm-up Render : pinger le vrai endpoint TTS pour forcer le chargement d'edge-tts
+    if (hasFastApi) {
+      const warmupUrl = (env.REDDIT_PROXY_URL ?? '').replace(/\/$/, '');
+      fetch(`${warmupUrl}/api/v1/tts/podcast-segment`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.REDDIT_PROXY_SECRET}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'Bonjour.', voice: 'host', provider: 'edge_tts', response_format: 'mp3' }),
+        signal: AbortSignal.timeout(120_000),
+      })
+        .then((r) => console.log(`[Podcast/deep_dive] FastAPI warm-up TTS ✓ (${r.status})`))
+        .catch(() => console.warn('[Podcast/deep_dive] FastAPI warm-up TTS timeout'));
+    }
 
-  const script = await generateDeepDiveScript(articles, env);
-  if (!script) {
-    console.warn('[Podcast/deep_dive] Échec génération script');
-    return;
-  }
-  console.log(`[Podcast/deep_dive] Script OK : "${script.title}" (${script.segments.length} segments)`);
+    // Articles de la semaine pour choisir le sujet le plus riche
+    const articles = await fetchTopArticles(env, 50, 7 * 24);
+    if (articles.length < 1) {
+      console.log('[Podcast] Aucun article cette semaine — Deep Dive annulé');
+      return { status: 'skipped', reason: 'not_enough_fresh_articles' };
+    }
+    console.log(`[Podcast/deep_dive] ${articles.length} articles candidats`);
 
-  await uploadAndSave(script, 'deep_dive', env);
-  await notifyPodcastReady(env, script.title, 'deep_dive');
-  // Le cleanup est fait par generateDailyPodcast — pas besoin de le doubler le vendredi
+    const script = await generateDeepDiveScript(articles, env);
+    if (!script) {
+      console.warn('[Podcast/deep_dive] Échec génération script');
+      return { status: 'failed', reason: 'script_generation_failed' };
+    }
+    console.log(`[Podcast/deep_dive] Script OK : "${script.title}" (${script.segments.length} segments)`);
+
+    const podcastId = await uploadAndSave(script, 'deep_dive', env);
+    if (!podcastId) {
+      return { status: 'failed', reason: 'audio_upload_failed' };
+    }
+    await notifyPodcastReady(env, script.title, 'deep_dive');
+    // Le cleanup est fait par generateDailyPodcast — pas besoin de le doubler le vendredi
+    return { status: 'generated', podcastId, title: script.title };
+  } finally {
+    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner);
+  }
 }

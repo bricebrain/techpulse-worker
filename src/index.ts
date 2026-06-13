@@ -555,13 +555,22 @@ export default {
         console.log(`[SyncGen] Démarrage à ${t0}`);
         try {
           console.log(`[SyncGen] PODCASTS=${!!env.PODCASTS} OPENAI=${!!env.OPENAI_API_KEY} GROQ=${!!(env.GROQ_API_KEY_1 ?? env.GROQ_API_KEY_2)}`);
-          await generateDailyPodcast(env);
+          const generation = await generateDailyPodcast(env);
           const elapsed = Date.now() - t0;
-          console.log(`[SyncGen] generateDailyPodcast terminé en ${elapsed}ms`);
+          console.log(`[SyncGen] generateDailyPodcast terminé en ${elapsed}ms (${generation.status})`);
           const result = await env.DB.prepare(
             `SELECT id, title FROM podcast_feed ORDER BY generated_at DESC LIMIT 1`
           ).first<{ id: string; title: string }>();
-          return json({ done: true, elapsed_ms: elapsed, latest: result ?? null });
+          return json({
+            done: generation.status === 'generated',
+            skipped: generation.status === 'skipped',
+            reason: generation.reason ?? null,
+            elapsed_ms: elapsed,
+            generated: generation.podcastId
+              ? { id: generation.podcastId, title: generation.title ?? null }
+              : null,
+            latest: result ?? null,
+          }, generation.reason === 'podcast_generation_already_running' ? 202 : 200);
         } catch (e) {
           console.error(`[SyncGen] Exception: ${String(e)}`);
           return json({ done: false, error: String(e), elapsed_ms: Date.now() - t0 }, 500);
@@ -598,6 +607,23 @@ export default {
     // ── POST /podcasts/generate-deep-dive — Deep Dive manuellement ─────────
     if (method === 'POST' && path === '/podcasts/generate-deep-dive') {
       if (!hasAdminAccess()) return err('Non autorisé', 401);
+      if (url.searchParams.get('sync') === '1') {
+        const t0 = Date.now();
+        try {
+          const generation = await generateDeepDivePodcast(env);
+          return json({
+            done: generation.status === 'generated',
+            skipped: generation.status === 'skipped',
+            reason: generation.reason ?? null,
+            elapsed_ms: Date.now() - t0,
+            generated: generation.podcastId
+              ? { id: generation.podcastId, title: generation.title ?? null }
+              : null,
+          }, generation.reason === 'podcast_generation_already_running' ? 202 : 200);
+        } catch (e) {
+          return json({ done: false, error: String(e), elapsed_ms: Date.now() - t0 }, 500);
+        }
+      }
       ctx.waitUntil(generateDeepDivePodcast(env));
       return json({ message: 'Génération Deep Dive lancée en arrière-plan' });
     }

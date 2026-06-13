@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS config (
   updated_at TEXT NOT NULL
 );
 
+-- Verrous applicatifs courts (anti double-run podcast, jobs ponctuels)
+CREATE TABLE IF NOT EXISTS runtime_locks (
+  key        TEXT PRIMARY KEY,
+  owner      TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 -- Suggestions IA (thèmes émergents + chaînes YouTube)
 CREATE TABLE IF NOT EXISTS suggestions (
   id           TEXT PRIMARY KEY,
@@ -76,6 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_theme       ON articles(theme);
 CREATE INDEX IF NOT EXISTS idx_articles_fetched_at  ON articles(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_articles_classified  ON articles(classified_theme);
 CREATE INDEX IF NOT EXISTS idx_article_embeddings_updated_at ON article_embeddings(updated_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sources_theme        ON sources(theme);
 CREATE INDEX IF NOT EXISTS idx_sources_active       ON sources(is_active);
 CREATE INDEX IF NOT EXISTS idx_podcast_generated    ON podcast_feed(generated_at);
