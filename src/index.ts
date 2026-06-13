@@ -9,6 +9,7 @@ import { adminPage } from './admin';
 import { handleProxy } from './proxy';
 import { handleApiV2 } from './api-v2';
 import { getNeonAdminStatus } from './neon-admin';
+import { getArticleFeedbackStats, recordArticleFeedback } from './feedback';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -85,6 +86,11 @@ export default {
     const apiV2Response = await handleApiV2(req, env);
     if (apiV2Response) return apiV2Response;
 
+    // ── POST /feedback/article — signal utilisateur pour ranking et Prompt Lab ──
+    if (method === 'POST' && path === '/feedback/article') {
+      return recordArticleFeedback(req, env);
+    }
+
     // ── Routes privées de maintenance ─────────────────────────────────────
 
 // ── POST /classify/test — test Workers AI sur un titre ───────────────
@@ -102,6 +108,12 @@ export default {
     // ── GET /admin — page d'administration ───────────────────────────────
     if (method === 'GET' && path === '/admin') {
       return adminPage();
+    }
+
+    // ── GET /admin/feedback/stats — signaux utilisateur pour Prompt Lab ───
+    if (method === 'GET' && path === '/admin/feedback/stats') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      return getArticleFeedbackStats(env);
     }
 
     // ── GET /articles?theme=youtube&limit=30&classified=ai ───────────────

@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS runtime_locks (
   updated_at TEXT NOT NULL
 );
 
+-- Feedback utilisateur collecté depuis l'app pour ranking et futur Prompt Lab
+CREATE TABLE IF NOT EXISTS article_feedback (
+  article_hash TEXT PRIMARY KEY,
+  source_name  TEXT NOT NULL,
+  theme        TEXT,
+  title        TEXT NOT NULL,
+  sentiment    TEXT NOT NULL, -- 'interesting' | 'neutral' | 'not_interesting'
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+
 -- Suggestions IA (thèmes émergents + chaînes YouTube)
 CREATE TABLE IF NOT EXISTS suggestions (
   id           TEXT PRIMARY KEY,
@@ -85,6 +96,9 @@ CREATE INDEX IF NOT EXISTS idx_articles_fetched_at  ON articles(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_articles_classified  ON articles(classified_theme);
 CREATE INDEX IF NOT EXISTS idx_article_embeddings_updated_at ON article_embeddings(updated_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_article_feedback_sentiment ON article_feedback(sentiment);
+CREATE INDEX IF NOT EXISTS idx_article_feedback_theme ON article_feedback(theme);
+CREATE INDEX IF NOT EXISTS idx_article_feedback_updated_at ON article_feedback(updated_at);
 CREATE INDEX IF NOT EXISTS idx_sources_theme        ON sources(theme);
 CREATE INDEX IF NOT EXISTS idx_sources_active       ON sources(is_active);
 CREATE INDEX IF NOT EXISTS idx_podcast_generated    ON podcast_feed(generated_at);
