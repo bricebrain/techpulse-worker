@@ -97,6 +97,10 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
       return getSignals(sql, url);
     }
 
+    if (path === '/api/v2/serendipity') {
+      return getSerendipity(sql, url);
+    }
+
     return err('Route API v2 inconnue', 404);
   } catch (error) {
     console.error('[api-v2] Neon query failed', error);
@@ -608,5 +612,111 @@ async function getSignals(sql: Sql, url: URL): Promise<Response> {
     latest_llm_digest: weakSignalAnalyses[0] ? normalizeAnalysis(weakSignalAnalyses[0]) : null,
     count: clusters.length,
     source: 'neon',
+  });
+}
+
+interface SerendipityRow {
+  id: string;
+  arxiv_id: string | null;
+  source_url: string | null;
+  domain: string | null;
+  arxiv_category: string | null;
+  title_choc: string;
+  enigme: string | null;
+  personnage: string | null;
+  concept: string | null;
+  so_what: string | null;
+  paper_title: string | null;
+  authors: unknown;
+  published_at: string | Date | null;
+  created_at: string | Date | null;
+}
+
+interface SerendipityFallbackArticleRow {
+  id: string;
+  title: string;
+  description: string | null;
+  source_name: string | null;
+  url: string | null;
+  category: string | null;
+  published_at: string | Date | null;
+  fetched_at: string | Date | null;
+}
+
+function arxivIdFromUrl(url: string | null): string | null {
+  if (!url) return null;
+  const match = url.match(/arxiv\.org\/abs\/([^?#/]+)/i);
+  if (!match?.[1]) return null;
+  return match[1].replace(/v\d+$/i, '');
+}
+
+function normalizeSerendipityCard(c: SerendipityRow): Record<string, unknown> {
+  return {
+    ...c,
+    authors: Array.isArray(c.authors) ? c.authors : [],
+    published_at: toIso(c.published_at),
+    created_at: toIso(c.created_at),
+  };
+}
+
+function fallbackArticleToSerendipityCard(article: SerendipityFallbackArticleRow): Record<string, unknown> {
+  const arxivId = arxivIdFromUrl(article.url);
+  return {
+    id: `arxiv_${article.id}`,
+    arxiv_id: arxivId,
+    source_url: article.url,
+    domain: article.category || 'science',
+    arxiv_category: article.category,
+    title_choc: article.title,
+    enigme: article.description || 'Papier scientifique récent détecté dans les sources arXiv.',
+    personnage: article.source_name ? `Source: ${article.source_name}` : null,
+    concept: article.description,
+    so_what: 'Carte temporaire issue du flux arXiv brut. Une vulgarisation plus profonde sera affichée après le prochain run sérendipité.',
+    paper_title: article.title,
+    authors: [],
+    published_at: toIso(article.published_at),
+    created_at: toIso(article.fetched_at),
+    fallback: true,
+  };
+}
+
+async function getSerendipity(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 12, 30);
+  const cards = await rows<SerendipityRow>(sql`
+    SELECT id, arxiv_id, source_url, domain, arxiv_category,
+           title_choc, enigme, personnage, concept, so_what,
+           paper_title, authors, published_at, created_at
+    FROM serendipity_cards
+    WHERE status = 'active'
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `);
+
+  if (cards.length > 0) {
+    return json({
+      cards: cards.map(normalizeSerendipityCard),
+      count: cards.length,
+      source: 'neon',
+      mode: 'serendipity_cards',
+    });
+  }
+
+  const fallbackArticles = await rows<SerendipityFallbackArticleRow>(sql`
+    SELECT id, title, description, source_name, url, category, published_at, fetched_at
+    FROM articles
+    WHERE (
+      LOWER(COALESCE(source_type, '')) = 'arxiv'
+      OR LOWER(COALESCE(source_name, '')) LIKE '%arxiv%'
+      OR COALESCE(url, '') ~* 'arxiv\\.org/(abs|pdf)/'
+    )
+    ORDER BY published_at DESC NULLS LAST, fetched_at DESC NULLS LAST
+    LIMIT ${limit}
+  `);
+
+  return json({
+    cards: fallbackArticles.map(fallbackArticleToSerendipityCard),
+    count: fallbackArticles.length,
+    source: 'neon',
+    mode: 'arxiv_fallback',
   });
 }
