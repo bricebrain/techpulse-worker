@@ -8,6 +8,7 @@ import { fetchGrokLive } from './fetchers/grok';
 import { classifyAndStore } from './classifier';
 
 const ARTICLE_TTL_DAYS = 7;
+const MAX_SOURCES_PER_FETCH_CRON = 28;
 
 // ─── Déduplication sémantique (Workers AI) + fallback Jaccard ────────────────
 // Embeddings @cf/baai/bge-base-en-v1.5 → cosine ≥ 0.88 = même histoire.
@@ -173,18 +174,34 @@ export async function runCronFetch(env: Env): Promise<void> {
 
   // 1. Sources actives
   const { results: sources } = await env.DB.prepare(
-    'SELECT * FROM sources WHERE is_active = 1'
-  ).all<Source>();
+    `SELECT * FROM sources
+     WHERE is_active = 1
+     ORDER BY datetime(COALESCE(updated_at, created_at)) ASC, name ASC
+     LIMIT ?`
+  ).bind(MAX_SOURCES_PER_FETCH_CRON).all<Source>();
+
+  console.log(`[Cron/Fetch] Sources sélectionnées : ${sources.length}/${MAX_SOURCES_PER_FETCH_CRON}`);
 
   // 2. Fetch parallèle par chunks de 10
   const chunks = chunkArray(sources, 10);
   const allArticles: Article[] = [];
   for (const chunk of chunks) {
-    const results = await Promise.allSettled(chunk.map((s) => fetchSource(s, env)));
+    const results = await Promise.allSettled(
+      chunk.map(async (source) => ({ source, articles: await fetchSource(source, env) })),
+    );
+    const fetchedAt = new Date().toISOString();
+    const sourceUpdates: D1PreparedStatement[] = [];
     for (const r of results) {
-      if (r.status === 'fulfilled') allArticles.push(...r.value);
-      else console.warn('[Cron/Fetch] Source échouée:', r.reason);
+      if (r.status === 'fulfilled') {
+        allArticles.push(...r.value.articles);
+        sourceUpdates.push(
+          env.DB.prepare('UPDATE sources SET updated_at = ? WHERE id = ?').bind(fetchedAt, r.value.source.id),
+        );
+      } else {
+        console.warn('[Cron/Fetch] Source échouée:', r.reason);
+      }
     }
+    if (sourceUpdates.length > 0) await env.DB.batch(sourceUpdates);
   }
   console.log(`[Cron/Fetch] ${allArticles.length} articles récupérés`);
 

@@ -39,7 +39,12 @@ function getThemeGuidance(theme: string): string {
     case 'general':
       return 'Prioritize developer platforms, software infrastructure, browser and runtime changes, backend tooling, cloud launches, databases, notable framework releases, and engineering announcements from major tech companies.';
     case 'science':
-      return 'Prioritize surprising frontier science and applied research: astrophysics, quantum physics, neuroscience, biotech, medicine, climate science, materials, robotics, space science, semiconductors, and research that may reshape technology over the next decade.';
+      return [
+        'Prioritize concrete scientific signals over general science news.',
+        'Look for preprints, peer-reviewed papers, lab results, clinical trials, datasets, instruments, missions, and discoveries with non-obvious implications.',
+        'Cover multiple disciplines: astrophysics, quantum physics, neuroscience, biotech, medicine, chemistry, earth science, climate science, materials, robotics, space science, semiconductors, and computational science.',
+        'Prefer subjects that a curious technical reader probably would not have searched for explicitly.',
+      ].join(' ');
     default:
       return 'Prioritize timely, high-signal developments that matter in a professional technology and finance watch workflow.';
   }
@@ -55,8 +60,9 @@ function buildPrompt(source: Source, limit: number): string {
     `- Goal: find early, high-signal developments that are useful in a professional watch product.\n\n` +
     `Editorial guidance:\n` +
     `- ${themeGuidance}\n` +
-    `- Prefer primary or high-credibility reporting when possible.\n` +
-    `- Prefer concrete news, research papers, lab results, discoveries, launches, filings, partnerships, regulation, product updates, or engineering changes.\n` +
+    `- Prefer primary sources, journal pages, preprint servers, research institutions, or high-credibility science reporting when possible.\n` +
+    `- Prefer concrete news, research papers, preprints, lab results, clinical trials, discoveries, datasets, launches, filings, partnerships, regulation, product updates, or engineering changes.\n` +
+    `- For science sources, select items with a clear "why it matters" angle: mechanism, surprising result, method, limitation, or future application.\n` +
     `- Avoid generic explainers, tutorials, jobs, opinion pieces, listicles, evergreen content, and low-value recap posts.\n` +
     `- Avoid returning near-duplicate articles that all say the same thing.\n\n` +
     `Return exactly the ${limit} strongest and most recent news articles (published in the last 48 hours) as a valid JSON array:\n` +

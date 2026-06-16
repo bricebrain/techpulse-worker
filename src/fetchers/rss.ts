@@ -26,8 +26,8 @@ function parseXml(xml: string, source: Source): Article[] {
   // Supporte RSS 2.0 et Atom
   const isAtom = xml.includes('<feed');
   const itemRegex = isAtom
-    ? /<entry>([\s\S]*?)<\/entry>/g
-    : /<item>([\s\S]*?)<\/item>/g;
+    ? /<entry\b[^>]*>([\s\S]*?)<\/entry>/g
+    : /<item\b[^>]*>([\s\S]*?)<\/item>/g;
 
   let match: RegExpExecArray | null;
   while ((match = itemRegex.exec(xml)) !== null) {
@@ -35,9 +35,12 @@ function parseXml(xml: string, source: Source): Article[] {
     const title = extractTag(block, 'title');
     const url   = extractLink(block, isAtom);
     const desc  = extractTag(block, isAtom ? 'summary' : 'description') ||
+                  extractTag(block, 'content:encoded') ||
                   extractTag(block, 'content');
     const dateStr = extractTag(block, isAtom ? 'updated' : 'pubDate') ||
-                    extractTag(block, 'published');
+                    extractTag(block, 'published') ||
+                    extractTag(block, 'dc:date') ||
+                    extractTag(block, 'prism:publicationDate');
 
     if (!title) continue;
 
@@ -68,13 +71,30 @@ function extractTag(block: string, tag: string): string {
 
 function extractLink(block: string, isAtom: boolean): string {
   if (isAtom) {
+    const alternate = block.match(/<link[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["'][^>]*\/?>/i);
+    if (alternate?.[1]) return decodeHtmlEntities(alternate[1]).trim();
     const m = block.match(/<link[^>]*href=["']([^"']+)["'][^>]*\/?>/i);
-    return m?.[1] ?? '';
+    return m?.[1] ? decodeHtmlEntities(m[1]).trim() : '';
   }
   const m = block.match(/<link>([\s\S]*?)<\/link>/i);
-  return m?.[1]?.trim() ?? '';
+  return m?.[1] ? decodeHtmlEntities(m[1]).trim() : '';
 }
 
 function stripHtml(html: string): string {
-  return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return decodeHtmlEntities(html)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#039;/g, "'");
 }
