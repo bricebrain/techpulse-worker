@@ -38,6 +38,8 @@ function getThemeGuidance(theme: string): string {
       return 'Prioritize market-moving developments in tech finance: earnings, semiconductor demand, cloud margins, AI capex, fintech infrastructure, crypto market structure, ETF flows, regulation, funding, and M&A.';
     case 'general':
       return 'Prioritize developer platforms, software infrastructure, browser and runtime changes, backend tooling, cloud launches, databases, notable framework releases, and engineering announcements from major tech companies.';
+    case 'science':
+      return 'Prioritize surprising frontier science and applied research: astrophysics, quantum physics, neuroscience, biotech, medicine, climate science, materials, robotics, space science, semiconductors, and research that may reshape technology over the next decade.';
     default:
       return 'Prioritize timely, high-signal developments that matter in a professional technology and finance watch workflow.';
   }
@@ -54,7 +56,7 @@ function buildPrompt(source: Source, limit: number): string {
     `Editorial guidance:\n` +
     `- ${themeGuidance}\n` +
     `- Prefer primary or high-credibility reporting when possible.\n` +
-    `- Prefer concrete news, launches, filings, earnings, partnerships, regulation, product updates, or engineering changes.\n` +
+    `- Prefer concrete news, research papers, lab results, discoveries, launches, filings, partnerships, regulation, product updates, or engineering changes.\n` +
     `- Avoid generic explainers, tutorials, jobs, opinion pieces, listicles, evergreen content, and low-value recap posts.\n` +
     `- Avoid returning near-duplicate articles that all say the same thing.\n\n` +
     `Return exactly the ${limit} strongest and most recent news articles (published in the last 48 hours) as a valid JSON array:\n` +
