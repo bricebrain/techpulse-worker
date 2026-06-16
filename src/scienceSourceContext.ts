@@ -3,10 +3,22 @@ interface SourceContextInput {
   sourceName: string;
   title: string;
   content: string | null;
+  xaiApiKey?: string;
 }
 
 const MIN_EXISTING_CONTEXT = 900;
+const MIN_CONTEXT_FOR_WEB_SEARCH = 1200;
 const MAX_CONTEXT_CHARS = 4200;
+
+interface XaiResponsesOutput {
+  type: string;
+  content?: Array<{ type: string; text?: string }>;
+}
+
+interface XaiResponsesResult {
+  output?: XaiResponsesOutput[];
+  status?: string;
+}
 
 function decodeHtml(value: string): string {
   return value
@@ -94,10 +106,97 @@ function isFetchableUrl(url: string | null): url is string {
   return !url.includes('news.google.com/rss/articles/');
 }
 
+function extractXaiText(data: XaiResponsesResult): string {
+  for (const out of data.output ?? []) {
+    if (out.type !== 'message') continue;
+    for (const block of out.content ?? []) {
+      if (block.type === 'output_text' && block.text) return block.text;
+    }
+  }
+  return '';
+}
+
+function parseContextJson(text: string): string {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return normalizeText(text, MAX_CONTEXT_CHARS);
+  try {
+    const parsed = JSON.parse(match[0]) as { context?: unknown; sources?: unknown };
+    const context = typeof parsed.context === 'string' ? parsed.context : '';
+    const sources = Array.isArray(parsed.sources)
+      ? parsed.sources.filter((item): item is string => typeof item === 'string').slice(0, 5)
+      : [];
+    return normalizeText(
+      [context, sources.length ? `Sources consultées: ${sources.join(' ; ')}` : ''].join('\n'),
+      MAX_CONTEXT_CHARS,
+    );
+  } catch {
+    return normalizeText(text, MAX_CONTEXT_CHARS);
+  }
+}
+
+function buildWebSearchPrompt(input: SourceContextInput, existing: string): string {
+  return `Recherche sur le web le contenu scientifique réel correspondant à ce signal.
+
+Objectif : produire un contexte factuel exploitable par TechPulse pour écrire une fiche pédagogique.
+
+Contraintes :
+- Utilise uniquement des informations trouvées dans des sources réelles.
+- Privilégie la source primaire, le papier, le preprint, la revue, l'institution ou un média scientifique fiable.
+- Ne remplis pas avec des généralités si tu ne trouves pas l'article exact.
+- Reste factuel : méthode, résultat, mécanisme, limite, implication.
+- Si le sujet est médical, précise le stade de preuve quand il est identifiable.
+
+Signal :
+Titre : ${input.title}
+Source initiale : ${input.sourceName}
+URL initiale : ${input.url ?? 'absente'}
+Extrait déjà disponible : ${existing || 'aucun'}
+
+Réponds uniquement en JSON valide :
+{
+  "context": "contexte scientifique détaillé en français, 700 à 1200 mots si possible",
+  "sources": ["url source 1", "url source 2"]
+}`;
+}
+
+async function fetchXaiWebContext(input: SourceContextInput, existing: string): Promise<string> {
+  if (!input.xaiApiKey || existing.length >= MIN_CONTEXT_FOR_WEB_SEARCH) return existing;
+
+  try {
+    const res = await fetch('https://api.x.ai/v1/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${input.xaiApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'grok-4',
+        input: [
+          {
+            role: 'user',
+            content: buildWebSearchPrompt(input, existing),
+          },
+        ],
+        tools: [{ type: 'web_search' }],
+        temperature: 0.1,
+        max_output_tokens: 2500,
+      }),
+      signal: AbortSignal.timeout(55_000),
+    });
+
+    if (!res.ok) return existing;
+    const data = await res.json<XaiResponsesResult>();
+    const context = parseContextJson(extractXaiText(data));
+    return context.length > existing.length ? context : existing;
+  } catch {
+    return existing;
+  }
+}
+
 export async function buildScienceSourceContext(input: SourceContextInput): Promise<string> {
   const existing = normalizeText(input.content, MAX_CONTEXT_CHARS);
-  if (existing.length >= MIN_EXISTING_CONTEXT) return existing;
-  if (!isFetchableUrl(input.url)) return existing;
+  if (existing.length >= MIN_CONTEXT_FOR_WEB_SEARCH) return existing;
+  if (!isFetchableUrl(input.url)) return fetchXaiWebContext(input, existing);
 
   try {
     const res = await fetch(input.url, {
@@ -114,10 +213,13 @@ export async function buildScienceSourceContext(input: SourceContextInput): Prom
 
     const html = await res.text();
     const fetched = extractUsefulText(html);
-    if (fetched.length <= existing.length) return existing;
+    const best = fetched.length > existing.length ? fetched : existing;
+    if (best.length < MIN_EXISTING_CONTEXT) return fetchXaiWebContext(input, best);
 
-    return fetched;
+    return best.length < MIN_CONTEXT_FOR_WEB_SEARCH
+      ? await fetchXaiWebContext(input, best)
+      : best;
   } catch {
-    return existing;
+    return fetchXaiWebContext(input, existing);
   }
 }
