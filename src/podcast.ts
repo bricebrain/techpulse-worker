@@ -11,7 +11,7 @@
  * Flux commun :
  *   1. Fetch des meilleurs articles D1
  *   2. Script JSON via Groq (llama-3.3-70b)
- *   3. TTS segment par segment via RunPod Kokoro, puis fallbacks
+ *   3. TTS segment par segment via OpenAI gpt-4o-mini-tts, fallback Edge-TTS
  *   4. Upload MP3 dans R2  →  podcasts/{id}/{i}.mp3
  *   5. Sauvegarde métadonnées + segments_json dans D1
  *   6. Nettoyage des podcasts > 7 jours
@@ -108,15 +108,17 @@ const PODCAST_LOCK_KEY = 'podcast_generation';
 const PODCAST_LOCK_TTL_MS = 45 * 60 * 1000;
 
 async function ensureRuntimeLocksTable(env: Env): Promise<void> {
-  await env.DB.exec(`
-    CREATE TABLE IF NOT EXISTS runtime_locks (
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS runtime_locks (
       key        TEXT PRIMARY KEY,
       owner      TEXT NOT NULL,
       expires_at INTEGER NOT NULL,
       updated_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at);
-  `);
+    )`,
+  ).run();
+  await env.DB.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at)',
+  ).run();
 }
 
 async function acquireRuntimeLock(
@@ -421,7 +423,7 @@ async function generateDailyScript(
     `- Un seul narrateur. Toujours speaker="host". Ne jamais utiliser "analyst".\n` +
     `- Ton premium, sobre, analytique. Pas d'animateur radio, pas d'humour forcé.\n` +
     `- Interdit : "bonjour", "bienvenue", "merci d'avoir écouté", "on se retrouve", "installez-vous".\n` +
-    `- Écrire pour Kokoro TTS en français : phrases de 8 à 18 mots, ponctuation claire, peu d'anglicismes.\n` +
+    `- Écrire pour une synthèse vocale française : phrases de 8 à 18 mots, ponctuation claire, peu d'anglicismes.\n` +
     `- Déplier les acronymes : intelligence artificielle, processeur graphique, modèle de langage.\n` +
     `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral.`;
 
@@ -480,7 +482,7 @@ async function generateDeepDiveScript(
     `- Un seul narrateur. Toujours speaker="host". Ne jamais utiliser "analyst".\n` +
     `- Pédagogie par couches : chaque segment construit sur le précédent.\n` +
     `- Style premium : clair, dense, posé. Pas d'accueil, pas de conclusion bavarde.\n` +
-    `- Écrire pour Kokoro TTS en français : phrases de 8 à 18 mots, ponctuation claire.\n` +
+    `- Écrire pour une synthèse vocale française : phrases de 8 à 18 mots, ponctuation claire.\n` +
     `- Déplier les acronymes et chiffres complexes pour la voix.\n` +
     `- Aucun markdown, JSON pur, texte naturel et fluide à l'oral.`;
 
@@ -503,78 +505,8 @@ async function generateDeepDiveScript(
 }
 
 // ─── TTS segment par segment ──────────────────────────────────────────────────
-// Priorité : RunPod Kokoro → FastAPI Edge-TTS → OpenAI gpt-4o-mini-tts
-
-function base64ToArrayBuffer(value: string): ArrayBuffer {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
-async function synthesizeViaRunPod(
-  segment: PodcastSegment,
-  env: Env,
-): Promise<ArrayBuffer | null> {
-  if (!env.RUNPOD_API_KEY || !env.RUNPOD_AI_ENDPOINT_ID) return null;
-
-  try {
-    const res = await fetch(`https://api.runpod.ai/v2/${env.RUNPOD_AI_ENDPOINT_ID}/runsync`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        input: {
-          task: 'tts.kokoro',
-          text: segment.text,
-          speaker: segment.speaker,
-          lang_code: 'f',
-          format: 'mp3',
-          upload_to_r2: false,
-          return_base64: true,
-        },
-      }),
-      signal: AbortSignal.timeout(180_000),
-    });
-
-    if (!res.ok) {
-      console.warn(`[Podcast] RunPod TTS ${segment.id} → ${res.status}`);
-      return null;
-    }
-
-    const data = await res.json<{
-      status?: string;
-      output?: {
-        ok?: boolean;
-        error?: string;
-        output?: { audio_base64?: string };
-      };
-    }>();
-
-    if (data.status && data.status !== 'COMPLETED') {
-      console.warn(`[Podcast] RunPod TTS ${segment.id} status=${data.status}`);
-      return null;
-    }
-    if (!data.output?.ok) {
-      console.warn(`[Podcast] RunPod TTS ${segment.id} failed: ${data.output?.error ?? 'unknown error'}`);
-      return null;
-    }
-
-    const audioBase64 = data.output.output?.audio_base64;
-    if (!audioBase64) {
-      console.warn(`[Podcast] RunPod TTS ${segment.id} missing audio_base64`);
-      return null;
-    }
-    return base64ToArrayBuffer(audioBase64);
-  } catch (e) {
-    console.warn(`[Podcast] RunPod TTS exception ${segment.id}:`, e);
-    return null;
-  }
-}
+// Priorité : OpenAI gpt-4o-mini-tts → FastAPI Edge-TTS (Render)
+// (Kokoro/RunPod retiré : qualité française insuffisante.)
 
 async function synthesizeViaFastApi(
   segment: PodcastSegment,
@@ -630,7 +562,7 @@ async function synthesizeViaOpenAI(
         voice: config.voice,
         input: segment.text,
         instructions: config.instructions,
-        response_format: 'aac',
+        response_format: 'mp3',
       }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -650,22 +582,20 @@ async function synthesizeSegment(
   segment: PodcastSegment,
   env: Env,
 ): Promise<{ buffer: ArrayBuffer; ext: 'mp3' | 'aac' } | null> {
-  const runpodAudio = await synthesizeViaRunPod(segment, env);
-  if (runpodAudio) {
-    console.log(`[Podcast] Segment ${segment.id} → RunPod Kokoro ✓`);
-    return { buffer: runpodAudio, ext: 'mp3' };
+  // Principal : OpenAI gpt-4o-mini-tts (bon français, voix + instructions de ton).
+  const oaiAudio = await synthesizeViaOpenAI(segment, env);
+  if (oaiAudio) {
+    console.log(`[Podcast] Segment ${segment.id} → OpenAI gpt-4o-mini-tts ✓`);
+    return { buffer: oaiAudio, ext: 'mp3' };
   }
 
+  // Fallback : Edge-TTS via FastAPI (Render).
+  console.warn(`[Podcast] Fallback Edge-TTS pour ${segment.id}`);
   const edgeAudio = await synthesizeViaFastApi(segment, env);
   if (edgeAudio) {
     console.log(`[Podcast] Segment ${segment.id} → Edge-TTS ✓`);
     return { buffer: edgeAudio, ext: 'mp3' };
   }
-
-  // Fallback : OpenAI gpt-4o-mini-tts
-  console.warn(`[Podcast] Fallback OpenAI TTS pour ${segment.id}`);
-  const oaiAudio = await synthesizeViaOpenAI(segment, env);
-  if (oaiAudio) return { buffer: oaiAudio, ext: 'aac' };
 
   return null;
 }
@@ -842,7 +772,8 @@ export async function generateDailyPodcast(env: Env): Promise<PodcastGenerationR
     await cleanupOldPodcasts(env);
     return { status: 'generated', podcastId, title: script.title };
   } finally {
-    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner);
+    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner)
+      .catch((error) => console.warn('[Podcast] Impossible de libérer le verrou:', error));
   }
 }
 
@@ -911,6 +842,7 @@ export async function generateDeepDivePodcast(env: Env): Promise<PodcastGenerati
     // Le cleanup est fait par generateDailyPodcast — pas besoin de le doubler le vendredi
     return { status: 'generated', podcastId, title: script.title };
   } finally {
-    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner);
+    await releaseRuntimeLock(env, PODCAST_LOCK_KEY, lock.owner)
+      .catch((error) => console.warn('[Podcast] Impossible de libérer le verrou:', error));
   }
 }

@@ -3,6 +3,8 @@ interface SecretsStoreSecret {
   get(): Promise<string>;
 }
 
+type SecretBinding = string | SecretsStoreSecret | undefined;
+
 /** Clés API résolues (plain strings) pour passer aux helpers */
 export interface ResolvedSecrets {
   OPENAI_API_KEY: string;
@@ -20,13 +22,13 @@ export interface ResolvedSecrets {
  */
 export async function resolveSecrets(env: Env): Promise<ResolvedSecrets> {
   const [openai, openrouter, gemini, groq1, groq2, deepseek, xai] = await Promise.all([
-    env.OPENAI_API_KEY.get(),
-    env.OPENROUTER_API_KEY.get(),
-    env.GEMINI_API_KEY.get(),
-    env.GROQ_API_KEY_1.get(),
-    env.GROQ_API_KEY_2.get(),
-    env.DEEPSEEK_API_KEY.get(),
-    env.XAI_API_KEY.get(),
+    readSecret(env.OPENAI_API_KEY, 'OPENAI_API_KEY'),
+    readSecret(env.OPENROUTER_API_KEY, 'OPENROUTER_API_KEY'),
+    readSecret(env.GEMINI_API_KEY, 'GEMINI_API_KEY'),
+    readSecret(env.GROQ_API_KEY_1, 'GROQ_API_KEY_1'),
+    readSecret(env.GROQ_API_KEY_2, 'GROQ_API_KEY_2'),
+    readSecret(env.DEEPSEEK_API_KEY, 'DEEPSEEK_API_KEY'),
+    readSecret(env.XAI_API_KEY, 'XAI_API_KEY'),
   ]);
   return {
     OPENAI_API_KEY: openai,
@@ -39,17 +41,29 @@ export async function resolveSecrets(env: Env): Promise<ResolvedSecrets> {
   };
 }
 
+async function readSecret(binding: SecretBinding, name: string): Promise<string> {
+  if (!binding) return '';
+  if (typeof binding === 'string') return binding;
+  if (typeof binding.get !== 'function') return '';
+  try {
+    return await binding.get();
+  } catch (error) {
+    console.warn(`[Secrets] ${name} indisponible: ${String(error)}`);
+    return '';
+  }
+}
+
 export interface Env {
   DB: D1Database;
   AI: Ai;
   // Cloudflare Secrets Store — partagés entre workers (accès async via .get())
-  OPENAI_API_KEY: SecretsStoreSecret;
-  OPENROUTER_API_KEY: SecretsStoreSecret;
-  GEMINI_API_KEY: SecretsStoreSecret;
-  GROQ_API_KEY_1: SecretsStoreSecret;
-  GROQ_API_KEY_2: SecretsStoreSecret;
-  DEEPSEEK_API_KEY: SecretsStoreSecret;
-  XAI_API_KEY: SecretsStoreSecret;
+  OPENAI_API_KEY?: SecretBinding;
+  OPENROUTER_API_KEY?: SecretBinding;
+  GEMINI_API_KEY?: SecretBinding;
+  GROQ_API_KEY_1?: SecretBinding;
+  GROQ_API_KEY_2?: SecretBinding;
+  DEEPSEEK_API_KEY?: SecretBinding;
+  XAI_API_KEY?: SecretBinding;
   // Secrets spécifiques TechPulse (wrangler secret put)
   YOUTUBE_API_KEY_1?: string;
   YOUTUBE_API_KEY_2?: string;
