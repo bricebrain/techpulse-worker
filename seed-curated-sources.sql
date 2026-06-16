@@ -1,0 +1,15 @@
+INSERT OR IGNORE INTO sources VALUES
+  ('src_yt_science_etonnante','Science Etonnante','science','rss','https://www.youtube.com/feeds/videos.xml?user=ScienceEtonnante',3,1,0,datetime('now'),datetime('now')),
+  ('src_yt_balade_mentale','Balade Mentale','science','youtube_channel','UCS_7tplUgzJG4DhA16re5Yg',3,1,0,datetime('now'),datetime('now')),
+  ('src_yt_scilabus','Scilabus','science','youtube_channel','UCeR8BYZS7IHYjk_9Mh5JgkA',3,1,0,datetime('now'),datetime('now')),
+  ('src_yt_astronogeek','AstronoGeek','science','youtube_channel','UC5X4e8ScZI2AFd_vkjSoyoQ',3,1,0,datetime('now'),datetime('now')),
+  ('src_yt_dirtybiology','DirtyBiology','science','youtube_channel','UCtqICqGbPSbTN09K1_7VZ3Q',2,1,0,datetime('now'),datetime('now')),
+  ('src_yt_dr_nozman','Dr Nozman','science','youtube_channel','UCWnfDPdZw6A23UtuBpYBbAg',2,1,0,datetime('now'),datetime('now')),
+  ('src_yt_string_theory_fr','String Theory FR','science','youtube_channel','UCfxwT02Bu5R7l21uMAu8H1w',3,1,0,datetime('now'),datetime('now')),
+  ('src_owid','Our World in Data','science','rss','https://ourworldindata.org/atom.xml',4,1,0,datetime('now'),datetime('now')),
+  ('src_mit_tech_review','MIT Technology Review','general','rss','https://www.technologyreview.com/feed/',5,1,0,datetime('now'),datetime('now')),
+  ('src_noahpinion','Noahpinion','economy','rss','https://noahpinion.substack.com/feed',4,1,0,datetime('now'),datetime('now')),
+  ('src_doomberg','Doomberg','finance','rss','https://newsletter.doomberg.com/feed',4,1,0,datetime('now'),datetime('now')),
+  ('src_fred_blog','FRED Blog','economy','rss','https://fredblog.stlouisfed.org/feed/',4,1,0,datetime('now'),datetime('now')),
+  ('src_asianometry','Asianometry','ai','rss','https://www.asianometry.com/feed',4,1,0,datetime('now'),datetime('now')),
+  ('src_yt_asianometry','Asianometry YouTube','ai','youtube_channel','UC1LpsuAUaKoMzzJSEt5WImw',3,1,0,datetime('now'),datetime('now'));

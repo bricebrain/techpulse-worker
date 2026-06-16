@@ -4,6 +4,13 @@ import { buildScienceSourceContext } from './scienceSourceContext';
 const MODEL = '@cf/meta/llama-3.2-3b-instruct';
 const MAX_ARTICLES_PER_RUN = 2;
 const MIN_CONTEXT_FOR_STANDARD_GENERATION = 1200;
+const CURATED_SCIENCE_SOURCES = [
+  'Quanta Magazine',
+  'Our World in Data',
+  'Science Etonnante',
+  'Science News',
+  'Ars Technica Science',
+];
 
 interface ScienceArticleRow {
   hash: string;
@@ -324,16 +331,19 @@ export async function enrichScienceArticles(env: Env): Promise<void> {
        AND title NOT LIKE '%Symposium%'
        AND title NOT LIKE '%Activities%'
        AND title NOT LIKE '%Take Place%'
+       AND title NOT LIKE '%#shorts%'
+       AND title NOT LIKE '%#short%'
      ORDER BY
        CASE
-         WHEN source_name LIKE 'Grok %' THEN 0
-         WHEN source_name IN ('bioRxiv', 'medRxiv', 'PLOS ONE', 'Cell', 'The Lancet', 'Science News', 'Ars Technica Science', 'Quanta Magazine') THEN 1
+         WHEN source_name IN (${CURATED_SCIENCE_SOURCES.map(() => '?').join(',')}) THEN 0
+         WHEN source_name LIKE 'Grok %' THEN 1
+         WHEN source_name IN ('bioRxiv', 'medRxiv', 'PLOS ONE', 'Cell', 'The Lancet', 'Science News', 'Ars Technica Science') THEN 2
          ELSE 2
        END,
        LENGTH(COALESCE(content, '')) DESC,
        fetched_at DESC
      LIMIT ?`,
-  ).bind(cutoff, MAX_ARTICLES_PER_RUN).all<ScienceArticleRow>();
+  ).bind(cutoff, ...CURATED_SCIENCE_SOURCES, MAX_ARTICLES_PER_RUN).all<ScienceArticleRow>();
 
   if (!results.length) return;
 
