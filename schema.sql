@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS articles (
   source_name      TEXT NOT NULL,
   url              TEXT,
   content          TEXT,
+  title_fr         TEXT,
+  summary_fr       TEXT,
   published_at     INTEGER,
   fetched_at       INTEGER NOT NULL
 );

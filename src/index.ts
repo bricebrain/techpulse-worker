@@ -149,6 +149,16 @@ export default {
              ORDER BY published_at DESC, fetched_at DESC
              LIMIT ?`
           ).bind(limit).all()
+        : theme === 'science'
+        ? await env.DB.prepare(
+            `SELECT * FROM articles
+             WHERE theme = 'science'
+             ORDER BY
+               CASE WHEN summary_fr IS NOT NULL AND LENGTH(summary_fr) >= 450 THEN 0 ELSE 1 END,
+               published_at DESC,
+               fetched_at DESC
+             LIMIT ?`
+          ).bind(limit).all()
         : await env.DB.prepare(
             `SELECT * FROM articles
              WHERE theme = ? OR (theme = 'youtube' AND classified_theme = ?)

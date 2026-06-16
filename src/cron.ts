@@ -6,6 +6,7 @@ import { fetchGrokLive } from './fetchers/grok';
 // Neon sync removed — handled by GitHub Actions ingest pipeline
 // which reads from Worker API and writes to Neon directly.
 import { classifyAndStore } from './classifier';
+import { enrichScienceArticles } from './scienceEnricher';
 
 const ARTICLE_TTL_DAYS = 7;
 const MAX_SOURCES_PER_FETCH_CRON = 28;
@@ -368,6 +369,8 @@ export async function runCronEnrich(env: Env): Promise<void> {
     if (youtube.length > 0) await classifyAndStore(env, youtube);
     if (others.length  > 0) await classifyAndStore(env, others);
   }
+
+  await enrichScienceArticles(env);
 
   console.log('[Cron/Enrich] Terminé ✓');
 }
