@@ -1,4 +1,5 @@
 import type { Env } from './types';
+import { buildScienceSourceContext } from './scienceSourceContext';
 
 const MODEL = '@cf/meta/llama-3.2-3b-instruct';
 const MAX_ARTICLES_PER_RUN = 6;
@@ -7,6 +8,7 @@ interface ScienceArticleRow {
   hash: string;
   title: string;
   source_name: string;
+  url: string | null;
   content: string | null;
 }
 
@@ -25,7 +27,7 @@ function cleanText(value: string | null | undefined, limit: number): string {
 }
 
 function buildPrompt(article: ScienceArticleRow): string {
-  const content = cleanText(article.content, 1400);
+  const content = cleanText(article.content, 3600);
   return `Tu es l'éditeur scientifique pédagogique de TechPulse.
 
 Transforme cet article en fiche claire pour un lecteur technique curieux, en français.
@@ -41,7 +43,8 @@ Contraintes :
 Article :
 Titre : ${article.title}
 Source : ${article.source_name}
-Contenu disponible : ${content || 'aucun extrait fourni'}
+Contexte source disponible :
+${content || 'aucun extrait fourni'}
 
 Réponds uniquement en JSON valide :
 {
@@ -89,6 +92,43 @@ async function getGeminiKey(env: Env): Promise<string> {
   }
 }
 
+async function getXaiKey(env: Env): Promise<string> {
+  try {
+    return await env.XAI_API_KEY.get();
+  } catch {
+    return '';
+  }
+}
+
+async function generateWithXai(apiKey: string, article: ScienceArticleRow): Promise<ScienceBrief | null> {
+  if (!apiKey) return null;
+  try {
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'grok-4',
+        max_tokens: 900,
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: 'Tu es un éditeur scientifique. Réponds uniquement en JSON valide, sans markdown.' },
+          { role: 'user', content: buildPrompt(article) },
+        ],
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!res.ok) {
+      console.warn(`[ScienceEnricher] xAI HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+    return parseJsonObject(data.choices?.[0]?.message?.content ?? '');
+  } catch (e) {
+    console.warn('[ScienceEnricher] xAI error:', e);
+    return null;
+  }
+}
+
 async function generateWithGemini(apiKey: string, article: ScienceArticleRow): Promise<ScienceBrief | null> {
   if (!apiKey) return null;
   try {
@@ -133,10 +173,11 @@ async function generateWithWorkersAi(env: Env, article: ScienceArticleRow): Prom
 }
 
 export async function enrichScienceArticles(env: Env): Promise<void> {
+  const xaiKey = await getXaiKey(env);
   const geminiKey = await getGeminiKey(env);
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const { results } = await env.DB.prepare(
-    `SELECT hash, title, source_name, content
+    `SELECT hash, title, source_name, url, content
      FROM articles
      WHERE theme = 'science'
        AND fetched_at > ?
@@ -163,16 +204,24 @@ export async function enrichScienceArticles(env: Env): Promise<void> {
   const statements: D1PreparedStatement[] = [];
 
   for (const article of results) {
-    const brief = await generateWithGemini(geminiKey, article)
-      ?? await generateWithWorkersAi(env, article)
-      ?? buildFallbackBrief(article);
+    const sourceContext = await buildScienceSourceContext({
+      url: article.url,
+      sourceName: article.source_name,
+      title: article.title,
+      content: article.content,
+    });
+    const enrichedArticle = { ...article, content: sourceContext || article.content };
+    const brief = await generateWithXai(xaiKey, enrichedArticle)
+      ?? await generateWithGemini(geminiKey, enrichedArticle)
+      ?? await generateWithWorkersAi(env, enrichedArticle)
+      ?? buildFallbackBrief(enrichedArticle);
 
     statements.push(
       env.DB.prepare(
         `UPDATE articles
-         SET title_fr = ?, summary_fr = ?
+         SET content = ?, title_fr = ?, summary_fr = ?
          WHERE hash = ?`,
-      ).bind(brief.title_fr, brief.summary_fr, article.hash),
+      ).bind(enrichedArticle.content ?? article.content ?? null, brief.title_fr, brief.summary_fr, article.hash),
     );
     updated++;
   }
