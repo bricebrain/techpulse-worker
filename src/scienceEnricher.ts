@@ -47,6 +47,15 @@ function isMostlyFrench(summary: string): boolean {
     .replace(/L'idée\s*:/gi, '')
     .replace(/Le mécanisme\s*:/gi, '')
     .replace(/Pourquoi c'est intéressant\s*:/gi, '')
+    .replace(/TL;DR\s*:/gi, '')
+    .replace(/Niveau simple\s*:/gi, '')
+    .replace(/Niveau intermédiaire\s*:/gi, '')
+    .replace(/Niveau expert\s*:/gi, '')
+    .replace(/Pourquoi ça compte\s*:/gi, '')
+    .replace(/Mécanisme\s*:/gi, '')
+    .replace(/Concepts\s*:/gi, '')
+    .replace(/Fiabilité\s*:/gi, '')
+    .replace(/Pont transverse\s*:/gi, '')
     .replace(/À retenir\s*:/gi, '')
     .toLowerCase();
   const englishScore = countMatches(body, [
@@ -92,17 +101,22 @@ function buildPrompt(article: ScienceArticleRow): string {
   const content = cleanText(article.content, 3600);
   return `Tu es l'éditeur scientifique pédagogique de TechPulse.
 
-Transforme cet article en fiche claire pour un lecteur technique curieux, en français.
+Transforme cet article en fiche pédagogique à trois niveaux pour un lecteur francophone curieux.
 
 Contraintes :
 - La valeur "summary_fr" doit être intégralement en français.
 - Ne copie jamais une phrase anglaise de la source ; reformule et vulgarise en français.
 - N'invente aucun fait absent du titre ou du contenu.
-- Si l'information source est limitée, distingue clairement le fait observé et le contexte scientifique général.
-- Ne fais pas un résumé journalistique court : rends le sujet compréhensible.
-- Ton style doit être pédagogique, concret, sans jargon inutile.
-- Le brief doit faire 180 à 260 mots.
-- Structure le brief avec ces lignes : "L'idée :", "Le mécanisme :", "Pourquoi c'est intéressant :", "À retenir :".
+- Les trois niveaux doivent monter en précision, pas seulement en longueur.
+- "Niveau simple" : 2 à 3 phrases, avec une analogie concrète si possible.
+- "Niveau intermédiaire" : 4 à 6 phrases, fond + chiffres clés présents dans la source.
+- "Niveau expert" : 4 à 6 phrases, nuances, limites, implications.
+- "Pourquoi ça compte" : 1 à 2 phrases, aucun superlatif creux.
+- "Mécanisme" : explique le COMMENT scientifique ou technique, pas seulement le QUOI.
+- "Concepts" : 1 à 4 notions clés, chacune définie en une phrase courte.
+- "Fiabilité" : choisis un seul label parmi peer-reviewed, preprint, communique, analyse, presse, rumeur.
+- "Pont transverse" : lien notable vers un autre domaine, ou "Aucun lien transverse évident".
+- Si l'information source est limitée, réponds null plutôt que de remplir avec des généralités.
 
 Article :
 Titre : ${article.title}
@@ -113,7 +127,7 @@ ${content || 'aucun extrait fourni'}
 Réponds uniquement en JSON valide :
 {
   "title_fr": "titre français clair, max 110 caractères",
-  "summary_fr": "fiche pédagogique en français"
+  "summary_fr": "TL;DR : ...\n\nNiveau simple : ...\n\nNiveau intermédiaire : ...\n\nNiveau expert : ...\n\nPourquoi ça compte : ...\n\nMécanisme : ...\n\nConcepts : Terme 1 — définition. Terme 2 — définition.\n\nFiabilité : peer-reviewed|preprint|communique|analyse|presse|rumeur\n\nPont transverse : ..."
 }`;
 }
 
@@ -207,7 +221,7 @@ function buildWebBriefPrompt(article: ScienceArticleRow): string {
   const content = cleanText(article.content, 1600);
   return `Tu es l'éditeur scientifique pédagogique de TechPulse.
 
-Recherche sur le web le sujet exact, puis produis une fiche pédagogique en français.
+Recherche sur le web le sujet exact, puis produis une fiche pédagogique à trois niveaux en français.
 
 Contraintes :
 - La valeur "summary_fr" doit être intégralement en français.
@@ -215,11 +229,16 @@ Contraintes :
 - Utilise la recherche web pour compléter l'information si l'extrait est insuffisant.
 - Privilégie source primaire, papier, preprint, revue, institution ou média scientifique fiable.
 - N'invente rien : si une information n'est pas confirmée, ne l'utilise pas.
+- Les trois niveaux doivent monter en précision, pas seulement en longueur.
+- "Niveau simple" : 2 à 3 phrases, avec une analogie concrète si possible.
+- "Niveau intermédiaire" : 4 à 6 phrases, fond + chiffres clés vérifiés.
+- "Niveau expert" : 4 à 6 phrases, nuances, limites, implications.
 - Explique le mécanisme scientifique, pas seulement l'annonce.
 - Si c'est médical, indique le stade de preuve : préclinique, phase 1/2/3, observationnel, revue, etc.
-- Évite les formulations génériques comme "ce signal permet de mesurer".
-- Le brief doit faire 220 à 320 mots.
-- Structure le brief avec : "L'idée :", "Le mécanisme :", "Pourquoi c'est intéressant :", "À retenir :".
+- Ajoute 1 à 4 concepts clés, chacun défini en une phrase.
+- Ajoute un label de fiabilité : peer-reviewed, preprint, communique, analyse, presse ou rumeur.
+- Ajoute un pont transverse vers économie, finance, IA, industrie ou société si pertinent.
+- Évite les formulations génériques.
 
 Signal initial :
 Titre : ${article.title}
@@ -230,7 +249,7 @@ Extrait disponible : ${content || 'aucun'}
 Réponds uniquement en JSON valide :
 {
   "title_fr": "titre français clair, max 110 caractères",
-  "summary_fr": "fiche pédagogique en français",
+  "summary_fr": "TL;DR : ...\n\nNiveau simple : ...\n\nNiveau intermédiaire : ...\n\nNiveau expert : ...\n\nPourquoi ça compte : ...\n\nMécanisme : ...\n\nConcepts : Terme 1 — définition. Terme 2 — définition.\n\nFiabilité : peer-reviewed|preprint|communique|analyse|presse|rumeur\n\nPont transverse : ...",
   "context": "contexte factuel condensé utilisé pour générer la fiche, avec noms de sources ou papiers"
 }`;
 }
