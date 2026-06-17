@@ -102,6 +102,12 @@ function capScoreByFreshness(score: number, freshnessLabel: 'fresh' | 'developin
   return score;
 }
 
+function capScoreByTopicSaturation(score: number, adjustment: number): number {
+  if (adjustment <= -32) return Math.min(score, 116);
+  if (adjustment <= -20) return Math.min(score, 124);
+  return score;
+}
+
 function topicBucket(cluster: PersonalizedFeedCluster): string {
   const title = typeof cluster.title === 'string' ? cluster.title.toLowerCase() : '';
   const summary = typeof cluster.summary === 'string' ? cluster.summary.toLowerCase() : '';
@@ -131,6 +137,48 @@ function diversifyTopClusters(clusters: PersonalizedFeedCluster[], limit: number
   }
 
   return [...selected, ...deferred].slice(0, limit);
+}
+
+function applyTopicSaturation(clusters: PersonalizedFeedCluster[]): PersonalizedFeedCluster[] {
+  const bucketCounts = clusters.reduce<Record<string, number>>((counts, cluster) => {
+    const bucket = topicBucket(cluster);
+    counts[bucket] = (counts[bucket] ?? 0) + 1;
+    return counts;
+  }, {});
+
+  const seenByBucket: Record<string, number> = {};
+  return clusters.map((cluster) => {
+    const bucket = topicBucket(cluster);
+    const count = bucketCounts[bucket] ?? 0;
+    const seen = seenByBucket[bucket] ?? 0;
+    seenByBucket[bucket] = seen + 1;
+
+    let delta = 0;
+    const reasons: string[] = [];
+    if (bucket !== 'general' && count >= 4) {
+      delta -= Math.min(36, 24 + (count - 4) * 4);
+      reasons.push('topic_saturated');
+    }
+    if (bucket !== 'general' && seen >= 1) {
+      delta -= Math.min(30, seen * 12);
+      reasons.push('duplicate_topic_in_feed');
+    }
+
+    const adjustedScore = capScoreByTopicSaturation(cluster.score + delta, delta);
+    const priorFreshnessReasons = Array.isArray(cluster.freshness_reasons)
+      ? cluster.freshness_reasons.filter((reason): reason is string => typeof reason === 'string')
+      : [];
+
+    return {
+      ...cluster,
+      score: adjustedScore,
+      topic_bucket: bucket,
+      topic_saturation_adjustment: delta,
+      topic_saturation_count: count,
+      freshness_reasons: [...priorFreshnessReasons, ...reasons],
+      freshness_label: delta <= -20 && cluster.freshness_label === 'fresh' ? 'developing' : cluster.freshness_label,
+    };
+  });
 }
 
 function getSql(env: Env): Sql | Response {
@@ -306,8 +354,7 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
     LIMIT ${candidateLimit}
   `);
 
-  const scoredClusters: PersonalizedFeedCluster[] = result
-    .map((row) => {
+  const mappedClusters: PersonalizedFeedCluster[] = result.map((row) => {
       const normalized = normalizeCluster(row);
       const previewArticles = asArray(row.preview_articles);
       const preference = scorePreferenceAdjustment({
@@ -339,7 +386,9 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
         preview_articles: previewArticles,
         analysis_preview: row.analysis_preview ?? null,
       };
-    })
+    });
+
+  const scoredClusters: PersonalizedFeedCluster[] = applyTopicSaturation(mappedClusters)
     .sort((left: PersonalizedFeedCluster, right: PersonalizedFeedCluster) => {
       const byScore = parseNumber(right.score) - parseNumber(left.score);
       if (byScore !== 0) return byScore;
