@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS article_feedback (
   updated_at   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS target_feedback (
+  target_type   TEXT NOT NULL,
+  target_id     TEXT NOT NULL,
+  feedback_type TEXT NOT NULL,
+  value         TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY(target_type, target_id, feedback_type)
+);
+
 -- Suggestions IA (thèmes émergents + chaînes YouTube)
 CREATE TABLE IF NOT EXISTS suggestions (
   id           TEXT PRIMARY KEY,
@@ -101,6 +111,9 @@ CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires
 CREATE INDEX IF NOT EXISTS idx_article_feedback_sentiment ON article_feedback(sentiment);
 CREATE INDEX IF NOT EXISTS idx_article_feedback_theme ON article_feedback(theme);
 CREATE INDEX IF NOT EXISTS idx_article_feedback_updated_at ON article_feedback(updated_at);
+CREATE INDEX IF NOT EXISTS idx_target_feedback_target ON target_feedback(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_target_feedback_type ON target_feedback(feedback_type);
+CREATE INDEX IF NOT EXISTS idx_target_feedback_updated_at ON target_feedback(updated_at);
 CREATE INDEX IF NOT EXISTS idx_sources_theme        ON sources(theme);
 CREATE INDEX IF NOT EXISTS idx_sources_active       ON sources(is_active);
 CREATE INDEX IF NOT EXISTS idx_podcast_generated    ON podcast_feed(generated_at);

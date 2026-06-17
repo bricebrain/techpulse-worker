@@ -10,7 +10,7 @@ import { handleProxy } from './proxy';
 import { handleApiV2 } from './api-v2';
 import { getNeonAdminStatus, resetRecentNeonAnalyses } from './neon-admin';
 import { enrichScienceArticles } from './scienceEnricher';
-import { getArticleFeedbackStats, recordArticleFeedback } from './feedback';
+import { getArticleFeedbackStats, recordArticleFeedback, recordTargetFeedback } from './feedback';
 
 export default {
   // ─── Cron ─────────────────────────────────────────────────────────────────
@@ -90,6 +90,10 @@ export default {
     // ── POST /feedback/article — signal utilisateur pour ranking et Prompt Lab ──
     if (method === 'POST' && path === '/feedback/article') {
       return recordArticleFeedback(req, env);
+    }
+
+    if (method === 'POST' && path === '/feedback/target') {
+      return recordTargetFeedback(req, env);
     }
 
     // ── Routes privées de maintenance ─────────────────────────────────────

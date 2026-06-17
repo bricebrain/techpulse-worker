@@ -2,6 +2,19 @@ import type { Env } from './types';
 import { err, json } from './utils';
 
 type ArticleFeedbackSentiment = 'interesting' | 'neutral' | 'not_interesting';
+type TargetFeedbackType =
+  | 'neutral'
+  | 'useful'
+  | 'not_useful'
+  | 'too_generic'
+  | 'duplicate'
+  | 'too_seen'
+  | 'deepen'
+  | 'follow_topic'
+  | 'hide_topic'
+  | 'too_complex'
+  | 'good_analysis'
+  | 'bad_analysis';
 
 export interface ArticleFeedbackRow {
   article_hash: string;
@@ -22,12 +35,36 @@ export interface FeedbackPreferenceProfile {
   preferred_terms: string[];
   disliked_terms: string[];
   latest_feedback: ArticleFeedbackRow[];
+  target_feedback: TargetFeedbackRow[];
+}
+
+export interface TargetFeedbackRow {
+  target_type: string;
+  target_id: string;
+  feedback_type: TargetFeedbackType;
+  value: string | null;
+  updated_at: string;
 }
 
 const VALID_SENTIMENTS = new Set<ArticleFeedbackSentiment>([
   'interesting',
   'neutral',
   'not_interesting',
+]);
+
+const VALID_TARGET_FEEDBACK_TYPES = new Set<TargetFeedbackType>([
+  'neutral',
+  'useful',
+  'not_useful',
+  'too_generic',
+  'duplicate',
+  'too_seen',
+  'deepen',
+  'follow_topic',
+  'hide_topic',
+  'too_complex',
+  'good_analysis',
+  'bad_analysis',
 ]);
 
 export async function ensureArticleFeedbackTable(env: Env): Promise<void> {
@@ -42,6 +79,21 @@ export async function ensureArticleFeedbackTable(env: Env): Promise<void> {
   ).run();
   await env.DB.prepare(
     'CREATE INDEX IF NOT EXISTS idx_article_feedback_updated_at ON article_feedback(updated_at)',
+  ).run();
+}
+
+export async function ensureTargetFeedbackTable(env: Env): Promise<void> {
+  await env.DB.prepare(
+    'CREATE TABLE IF NOT EXISTS target_feedback (target_type TEXT NOT NULL, target_id TEXT NOT NULL, feedback_type TEXT NOT NULL, value TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(target_type, target_id, feedback_type))',
+  ).run();
+  await env.DB.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_target_feedback_target ON target_feedback(target_type, target_id)',
+  ).run();
+  await env.DB.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_target_feedback_type ON target_feedback(feedback_type)',
+  ).run();
+  await env.DB.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_target_feedback_updated_at ON target_feedback(updated_at)',
   ).run();
 }
 
@@ -99,6 +151,7 @@ function emptyFeedbackPreferenceProfile(): FeedbackPreferenceProfile {
     preferred_terms: [],
     disliked_terms: [],
     latest_feedback: [],
+    target_feedback: [],
   };
 }
 
@@ -139,13 +192,24 @@ function buildFeedbackPreferenceProfile(results: ArticleFeedbackRow[]): Feedback
 
 export async function getArticleFeedbackPreferenceProfile(env: Env): Promise<FeedbackPreferenceProfile> {
   try {
-    const { results } = await env.DB.prepare(
-      `SELECT article_hash, source_name, theme, title, sentiment, updated_at
-       FROM article_feedback
-       ORDER BY updated_at DESC
-       LIMIT 500`,
-    ).all<ArticleFeedbackRow>();
-    return buildFeedbackPreferenceProfile(results);
+    const [articleFeedback, targetFeedback] = await Promise.all([
+      env.DB.prepare(
+        `SELECT article_hash, source_name, theme, title, sentiment, updated_at
+         FROM article_feedback
+         ORDER BY updated_at DESC
+         LIMIT 500`,
+      ).all<ArticleFeedbackRow>(),
+      env.DB.prepare(
+        `SELECT target_type, target_id, feedback_type, value, updated_at
+         FROM target_feedback
+         ORDER BY updated_at DESC
+         LIMIT 500`,
+      ).all<TargetFeedbackRow>().catch(() => ({ results: [] as TargetFeedbackRow[] })),
+    ]);
+    return {
+      ...buildFeedbackPreferenceProfile(articleFeedback.results),
+      target_feedback: targetFeedback.results,
+    };
   } catch (error) {
     console.warn('[feedback] Preference profile unavailable', error);
     return emptyFeedbackPreferenceProfile();
@@ -154,6 +218,8 @@ export async function getArticleFeedbackPreferenceProfile(env: Env): Promise<Fee
 
 export function scorePreferenceAdjustment(input: {
   sourceNames: string[];
+  articleIds?: string[];
+  clusterId?: string;
   title: string;
   summary?: string | null;
   profile: FeedbackPreferenceProfile;
@@ -188,10 +254,77 @@ export function scorePreferenceAdjustment(input: {
     }
   }
 
+  const articleIds = new Set(input.articleIds ?? []);
+  for (const feedback of input.profile.target_feedback) {
+    const isClusterMatch = feedback.target_type === 'cluster' && feedback.target_id === input.clusterId;
+    const isArticleMatch = feedback.target_type === 'article' && articleIds.has(feedback.target_id);
+    if (!isClusterMatch && !isArticleMatch) continue;
+
+    if (feedback.feedback_type === 'follow_topic' || feedback.feedback_type === 'useful') {
+      delta += 14;
+      reasons.push(`${feedback.target_type}:${feedback.feedback_type}:up`);
+    }
+    if (feedback.feedback_type === 'deepen') {
+      delta += 22;
+      reasons.push(`${feedback.target_type}:deepen:up`);
+    }
+    if (
+      feedback.feedback_type === 'hide_topic'
+      || feedback.feedback_type === 'not_useful'
+      || feedback.feedback_type === 'duplicate'
+      || feedback.feedback_type === 'too_seen'
+    ) {
+      delta -= feedback.feedback_type === 'too_seen' ? 32 : 24;
+      reasons.push(`${feedback.target_type}:${feedback.feedback_type}:down`);
+    }
+  }
+
   return {
-    delta: Math.max(-35, Math.min(20, delta)),
-    reasons: reasons.slice(0, 6),
+    delta: Math.max(-70, Math.min(45, delta)),
+    reasons: reasons.slice(0, 8),
   };
+}
+
+export async function recordTargetFeedback(req: Request, env: Env): Promise<Response> {
+  const body = await req.json<{
+    targetType?: string;
+    targetId?: string;
+    feedbackType?: TargetFeedbackType;
+    value?: string;
+  }>().catch(() => null);
+
+  const targetType = cleanText(body?.targetType, 40);
+  const targetId = cleanText(body?.targetId, 180);
+  const feedbackType = body?.feedbackType;
+  const value = cleanText(body?.value, 500) || null;
+
+  if (!targetType || !targetId || !feedbackType) {
+    return err('Payload feedback cible incomplet', 400);
+  }
+  if (!VALID_TARGET_FEEDBACK_TYPES.has(feedbackType)) {
+    return err('Type feedback cible invalide', 400);
+  }
+
+  await ensureTargetFeedbackTable(env);
+  const now = new Date().toISOString();
+
+  if (feedbackType === 'neutral') {
+    await env.DB.prepare(
+      'DELETE FROM target_feedback WHERE target_type = ? AND target_id = ?',
+    ).bind(targetType, targetId).run();
+    return json({ ok: true, target_type: targetType, target_id: targetId, feedback_type: feedbackType });
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO target_feedback (
+      target_type, target_id, feedback_type, value, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(target_type, target_id, feedback_type) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at`,
+  ).bind(targetType, targetId, feedbackType, value, now, now).run();
+
+  return json({ ok: true, target_type: targetType, target_id: targetId, feedback_type: feedbackType });
 }
 
 export async function recordArticleFeedback(req: Request, env: Env): Promise<Response> {
@@ -236,8 +369,9 @@ export async function recordArticleFeedback(req: Request, env: Env): Promise<Res
 
 export async function getArticleFeedbackStats(env: Env): Promise<Response> {
   await ensureArticleFeedbackTable(env);
+  await ensureTargetFeedbackTable(env);
 
-  const [summary, byTheme, recent] = await Promise.all([
+  const [summary, byTheme, recent, targetRecent] = await Promise.all([
     env.DB.prepare(
       `SELECT sentiment, COUNT(*) AS count
        FROM article_feedback
@@ -257,11 +391,18 @@ export async function getArticleFeedbackStats(env: Env): Promise<Response> {
        ORDER BY updated_at DESC
        LIMIT 20`,
     ).all(),
+    env.DB.prepare(
+      `SELECT target_type, target_id, feedback_type, value, updated_at
+       FROM target_feedback
+       ORDER BY updated_at DESC
+       LIMIT 30`,
+    ).all(),
   ]);
 
   return json({
     summary: summary.results,
     by_theme: byTheme.results,
     recent: recent.results,
+    target_recent: targetRecent.results,
   });
 }

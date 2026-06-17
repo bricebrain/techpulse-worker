@@ -266,6 +266,16 @@ function getPreviewArticleSources(previewArticles: unknown[]): string[] {
     .filter(Boolean);
 }
 
+function getPreviewArticleIds(previewArticles: unknown[]): string[] {
+  return previewArticles
+    .map((article) => {
+      if (!article || typeof article !== 'object') return '';
+      const id = (article as { id?: unknown }).id;
+      return typeof id === 'string' ? id : '';
+    })
+    .filter(Boolean);
+}
+
 async function getPreferences(env: Env): Promise<Response> {
   const profile = await getArticleFeedbackPreferenceProfile(env);
   return json({
@@ -359,6 +369,8 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
       const previewArticles = asArray(row.preview_articles);
       const preference = scorePreferenceAdjustment({
         sourceNames: getPreviewArticleSources(previewArticles),
+        articleIds: getPreviewArticleIds(previewArticles),
+        clusterId: typeof normalized.id === 'string' ? normalized.id : '',
         title: typeof normalized.title === 'string' ? normalized.title : '',
         summary: typeof normalized.summary === 'string' ? normalized.summary : null,
         profile: preferenceProfile,
