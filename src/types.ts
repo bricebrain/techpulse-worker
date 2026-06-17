@@ -20,7 +20,19 @@ export interface ResolvedSecrets {
  * Résout toutes les clés du Secrets Store en parallèle.
  * À appeler une seule fois en tête de chaque handler/cron qui en a besoin.
  */
+let resolvedSecretsCache: Promise<ResolvedSecrets> | null = null;
+
 export async function resolveSecrets(env: Env): Promise<ResolvedSecrets> {
+  if (resolvedSecretsCache) return resolvedSecretsCache;
+
+  resolvedSecretsCache = resolveSecretsOnce(env).catch((error) => {
+    resolvedSecretsCache = null;
+    throw error;
+  });
+  return resolvedSecretsCache;
+}
+
+async function resolveSecretsOnce(env: Env): Promise<ResolvedSecrets> {
   const [openai, openrouter, gemini, groq1, groq2, deepseek, xai] = await Promise.all([
     readSecret(env.OPENAI_API_KEY, 'OPENAI_API_KEY'),
     readSecret(env.OPENROUTER_API_KEY, 'OPENROUTER_API_KEY'),
