@@ -336,16 +336,21 @@ async function generateWithWorkersAi(env: Env, article: ScienceArticleRow): Prom
   }
 }
 
-export async function enrichScienceArticles(env: Env): Promise<void> {
+export async function enrichScienceArticles(
+  env: Env,
+  options: { force?: boolean; limit?: number } = {},
+): Promise<number> {
   const xaiKey = await getXaiKey(env);
   const geminiKey = await getGeminiKey(env);
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const limit = Math.max(1, Math.min(options.limit ?? MAX_ARTICLES_PER_RUN, 8));
+  const summaryFilter = options.force ? '' : 'AND (summary_fr IS NULL OR LENGTH(summary_fr) < 120)';
   const { results } = await env.DB.prepare(
     `SELECT hash, title, source_name, url, content
      FROM articles
      WHERE theme = 'science'
        AND fetched_at > ?
-       AND (summary_fr IS NULL OR LENGTH(summary_fr) < 120)
+       ${summaryFilter}
        AND title NOT LIKE '%Seminar%'
        AND title NOT LIKE '%Symposium%'
        AND title NOT LIKE '%Activities%'
@@ -362,11 +367,11 @@ export async function enrichScienceArticles(env: Env): Promise<void> {
        LENGTH(COALESCE(content, '')) DESC,
        fetched_at DESC
      LIMIT ?`,
-  ).bind(cutoff, ...CURATED_SCIENCE_SOURCES, MAX_ARTICLES_PER_RUN).all<ScienceArticleRow>();
+  ).bind(cutoff, ...CURATED_SCIENCE_SOURCES, limit).all<ScienceArticleRow>();
 
-  if (!results.length) return;
+  if (!results.length) return 0;
 
-  console.log(`[ScienceEnricher] Enrichissement de ${results.length} articles science`);
+  console.log(`[ScienceEnricher] Enrichissement de ${results.length} articles science${options.force ? ' (force)' : ''}`);
   let updated = 0;
 
   for (const article of results) {
@@ -397,4 +402,5 @@ export async function enrichScienceArticles(env: Env): Promise<void> {
   }
 
   console.log(`[ScienceEnricher] ${updated}/${results.length} articles enrichis`);
+  return updated;
 }

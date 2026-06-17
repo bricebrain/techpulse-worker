@@ -242,3 +242,89 @@ export async function getNeonAdminStatus(env: Env): Promise<Response> {
     }, 200);
   }
 }
+
+export async function resetRecentNeonAnalyses(
+  env: Env,
+  options: { days?: number; articleLimit?: number; clusterLimit?: number } = {},
+): Promise<Response> {
+  if (!env.NEON_DATABASE_URL) {
+    return err('NEON_DATABASE_URL non configuré', 503);
+  }
+
+  const days = Math.max(1, Math.min(options.days ?? 7, 14));
+  const articleLimit = Math.max(1, Math.min(options.articleLimit ?? 80, 200));
+  const clusterLimit = Math.max(1, Math.min(options.clusterLimit ?? 20, 50));
+  const sql = neon(env.NEON_DATABASE_URL);
+
+  try {
+    const [result] = await rows<{
+      article_intelligence_deleted: number | string;
+      articles_reset: number | string;
+      cluster_analyses_deleted: number | string;
+      clusters_reset: number | string;
+    }>(sql`
+      WITH target_articles AS (
+        SELECT id
+        FROM articles
+        WHERE fetched_at >= NOW() - (${days}::text || ' days')::interval
+          AND embedding IS NOT NULL
+        ORDER BY fetched_at DESC
+        LIMIT ${articleLimit}
+      ),
+      deleted_article_intelligence AS (
+        DELETE FROM article_intelligence
+        WHERE article_id IN (SELECT id FROM target_articles)
+        RETURNING article_id
+      ),
+      updated_articles AS (
+        UPDATE articles
+        SET llm_enrichment_status = 'pending',
+            analysis_status = NULL,
+            last_error = NULL,
+            last_processed_at = NOW()
+        WHERE id IN (SELECT id FROM target_articles)
+        RETURNING id
+      ),
+      target_clusters AS (
+        SELECT id
+        FROM clusters
+        WHERE status IN ('active', 'growing', 'peak')
+          AND last_updated_at >= NOW() - (${days}::text || ' days')::interval
+        ORDER BY importance_score DESC NULLS LAST, last_updated_at DESC
+        LIMIT ${clusterLimit}
+      ),
+      deleted_cluster_analyses AS (
+        DELETE FROM ai_analyses
+        WHERE target_type = 'cluster'
+          AND target_id IN (SELECT id FROM target_clusters)
+        RETURNING target_id
+      )
+      SELECT
+        (SELECT COUNT(*) FROM deleted_article_intelligence) AS article_intelligence_deleted,
+        (SELECT COUNT(*) FROM updated_articles) AS articles_reset,
+        (SELECT COUNT(*) FROM deleted_cluster_analyses) AS cluster_analyses_deleted,
+        (SELECT COUNT(*) FROM target_clusters) AS clusters_reset
+    `);
+
+    const articleIntelligenceDeleted = asNumber(result?.article_intelligence_deleted);
+    const articlesReset = asNumber(result?.articles_reset);
+    const clusterAnalysesDeleted = asNumber(result?.cluster_analyses_deleted);
+    const clustersReset = asNumber(result?.clusters_reset);
+
+    return json({
+      ok: true,
+      message: `Analyses remises en file : ${articlesReset} articles, ${clustersReset} clusters.`,
+      days,
+      article_intelligence_deleted: articleIntelligenceDeleted,
+      articles_reset: articlesReset,
+      cluster_analyses_deleted: clusterAnalysesDeleted,
+      clusters_reset: clustersReset,
+    });
+  } catch (error) {
+    return json({
+      ok: false,
+      message: 'Impossible de remettre les analyses en file.',
+      error: String(error).slice(0, 500),
+    }, 500);
+  }
+}

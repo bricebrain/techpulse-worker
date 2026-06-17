@@ -8,7 +8,8 @@ import { json, err, isAuthorized, makeHash } from './utils';
 import { adminPage } from './admin';
 import { handleProxy } from './proxy';
 import { handleApiV2 } from './api-v2';
-import { getNeonAdminStatus } from './neon-admin';
+import { getNeonAdminStatus, resetRecentNeonAnalyses } from './neon-admin';
+import { enrichScienceArticles } from './scienceEnricher';
 import { getArticleFeedbackStats, recordArticleFeedback } from './feedback';
 
 export default {
@@ -509,6 +510,20 @@ export default {
       if (!hasAdminAccess()) return err('Non autorisé', 401);
       ctx.waitUntil(runCronEnrich(env));
       return json({ message: 'Cron enrich lancé en arrière-plan' });
+    }
+
+    // ── POST /admin/reprocess/science — régénérer des fiches science ─────
+    if (method === 'POST' && path === '/admin/reprocess/science') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? '4'), 1), 8);
+      ctx.waitUntil(enrichScienceArticles(env, { force: true, limit }));
+      return json({ message: `Retraitement Science lancé (${limit} articles max).` });
+    }
+
+    // ── POST /admin/reprocess/analyses — remettre Neon en file ────────────
+    if (method === 'POST' && path === '/admin/reprocess/analyses') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      return resetRecentNeonAnalyses(env);
     }
 
     // ── GET /podcasts — liste des podcasts auto-générés ───────────────────
