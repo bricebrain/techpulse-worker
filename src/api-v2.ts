@@ -33,6 +33,106 @@ type PersonalizedFeedCluster = Record<string, unknown> & {
   last_updated_at?: unknown;
 };
 
+function ageHours(value: unknown): number {
+  if (typeof value !== 'string') return Infinity;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return Infinity;
+  return Math.max(0, (Date.now() - timestamp) / 3_600_000);
+}
+
+function scoreFreshnessAdjustment(input: {
+  firstSeenAt: unknown;
+  lastUpdatedAt: unknown;
+  growthScore: number;
+  noveltyScore: number;
+  articleCount: number;
+}): { delta: number; label: 'fresh' | 'developing' | 'fatigue' | 'stale'; reasons: string[] } {
+  const topicAge = ageHours(input.firstSeenAt);
+  const updateAge = ageHours(input.lastUpdatedAt);
+  const reasons: string[] = [];
+  let delta = 0;
+
+  if (topicAge <= 36) {
+    return { delta: 10, label: 'fresh', reasons: ['fresh_topic'] };
+  }
+
+  if (topicAge > 48) {
+    delta -= 10;
+    reasons.push('older_than_48h');
+  }
+  if (topicAge > 96) {
+    delta -= 18;
+    reasons.push('older_than_4d');
+  }
+  if (topicAge > 168) {
+    delta -= 22;
+    reasons.push('older_than_7d');
+  }
+  if (input.articleCount >= 8 && topicAge > 96) {
+    delta -= 10;
+    reasons.push('large_recurrent_story');
+  }
+  if (input.noveltyScore < 4 && topicAge > 72) {
+    delta -= 10;
+    reasons.push('low_novelty');
+  }
+
+  const isStillMoving = updateAge <= 18 && input.growthScore >= 12;
+  if (isStillMoving) {
+    delta += Math.min(18, Math.abs(delta) * 0.5);
+    reasons.push('still_moving');
+  }
+
+  const label = topicAge > 168
+    ? 'stale'
+    : delta <= -20
+      ? 'fatigue'
+      : 'developing';
+
+  return {
+    delta: Math.max(-55, Math.min(12, Math.round(delta))),
+    label,
+    reasons,
+  };
+}
+
+function capScoreByFreshness(score: number, freshnessLabel: 'fresh' | 'developing' | 'fatigue' | 'stale'): number {
+  if (freshnessLabel === 'stale') return Math.min(score, 82);
+  if (freshnessLabel === 'fatigue') return Math.min(score, 104);
+  return score;
+}
+
+function topicBucket(cluster: PersonalizedFeedCluster): string {
+  const title = typeof cluster.title === 'string' ? cluster.title.toLowerCase() : '';
+  const summary = typeof cluster.summary === 'string' ? cluster.summary.toLowerCase() : '';
+  const text = `${title} ${summary}`;
+  if (/\b(spacex|elon|tesla|xai|starship)\b/.test(text)) return 'musk-space';
+  if (/\b(openai|anthropic|claude|chatgpt|gpt-)\b/.test(text)) return 'frontier-ai';
+  if (/\b(iran|oil|opec|israel|middle east)\b/.test(text)) return 'geopolitics-energy';
+  if (/\b(android|google|wear os)\b/.test(text)) return 'google-android';
+  if (/\b(nvidia|gpu|semiconductor|chip|qualcomm|tsmc)\b/.test(text)) return 'chips';
+  return typeof cluster.main_theme === 'string' ? cluster.main_theme : 'general';
+}
+
+function diversifyTopClusters(clusters: PersonalizedFeedCluster[], limit: number): PersonalizedFeedCluster[] {
+  const selected: PersonalizedFeedCluster[] = [];
+  const deferred: PersonalizedFeedCluster[] = [];
+  const buckets = new Set<string>();
+  const protectedWindow = Math.min(limit, 8);
+
+  for (const cluster of clusters) {
+    const bucket = topicBucket(cluster);
+    if (selected.length < protectedWindow && buckets.has(bucket)) {
+      deferred.push(cluster);
+      continue;
+    }
+    selected.push(cluster);
+    buckets.add(bucket);
+  }
+
+  return [...selected, ...deferred].slice(0, limit);
+}
+
 function getSql(env: Env): Sql | Response {
   if (!env.NEON_DATABASE_URL) {
     return err('NEON_DATABASE_URL non configuré', 503);
@@ -128,7 +228,7 @@ async function getPreferences(env: Env): Promise<Response> {
 
 async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
   const limit = parseLimit(url, 30, 100);
-  const candidateLimit = Math.min(200, Math.max(limit * 3, limit));
+  const candidateLimit = Math.min(240, Math.max(limit * 5, 80));
   const preferenceProfile = await getArticleFeedbackPreferenceProfile(env);
   const result = await rows<FeedClusterRow>(sql`
     SELECT c.id, c.title, c.summary, c.main_theme, c.status,
@@ -206,7 +306,7 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
     LIMIT ${candidateLimit}
   `);
 
-  const clusters: PersonalizedFeedCluster[] = result
+  const scoredClusters: PersonalizedFeedCluster[] = result
     .map((row) => {
       const normalized = normalizeCluster(row);
       const previewArticles = asArray(row.preview_articles);
@@ -217,13 +317,25 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
         profile: preferenceProfile,
       });
       const baseScore = parseNumber(row.score);
+      const freshness = scoreFreshnessAdjustment({
+        firstSeenAt: normalized.first_seen_at,
+        lastUpdatedAt: normalized.last_updated_at,
+        growthScore: parseNumber(normalized.growth_score),
+        noveltyScore: parseNumber(normalized.novelty_score),
+        articleCount: parseNumber(normalized.article_count),
+      });
+
+      const adjustedScore = baseScore + preference.delta + freshness.delta;
 
       return {
         ...normalized,
-        score: baseScore + preference.delta,
+        score: capScoreByFreshness(adjustedScore, freshness.label),
         base_score: baseScore,
         preference_adjustment: preference.delta,
         preference_reasons: preference.reasons,
+        freshness_adjustment: freshness.delta,
+        freshness_label: freshness.label,
+        freshness_reasons: freshness.reasons,
         preview_articles: previewArticles,
         analysis_preview: row.analysis_preview ?? null,
       };
@@ -234,8 +346,8 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
       const leftDate = typeof left.last_updated_at === 'string' ? Date.parse(left.last_updated_at) : 0;
       const rightDate = typeof right.last_updated_at === 'string' ? Date.parse(right.last_updated_at) : 0;
       return rightDate - leftDate;
-    })
-    .slice(0, limit);
+    });
+  const clusters = diversifyTopClusters(scoredClusters, limit);
 
   return json({
     clusters,
