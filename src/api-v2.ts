@@ -246,7 +246,7 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
     }
 
     if (path === '/api/v2/serendipity') {
-      return getSerendipity(sql, url);
+      return getSerendipity(sql, env, url);
     }
 
     return err('Route API v2 inconnue', 404);
@@ -805,6 +805,18 @@ interface SerendipityRow {
   created_at: string | Date | null;
 }
 
+interface ScienceSerendipityArticleRow {
+  hash: string;
+  title: string;
+  title_fr: string | null;
+  source_name: string;
+  url: string | null;
+  content: string | null;
+  summary_fr: string | null;
+  published_at: number | null;
+  fetched_at: number;
+}
+
 function normalizeSerendipityCard(c: SerendipityRow): Record<string, unknown> {
   return {
     ...c,
@@ -814,24 +826,166 @@ function normalizeSerendipityCard(c: SerendipityRow): Record<string, unknown> {
   };
 }
 
-async function getSerendipity(sql: Sql, url: URL): Promise<Response> {
+function isScientificSerendipityCard(card: SerendipityRow): boolean {
+  const text = [
+    card.domain,
+    card.title_choc,
+    card.enigme,
+    card.concept,
+    card.so_what,
+    card.paper_title,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (/\b(ipo|nasdaq|oil|pétrole|petrole|détroit d'ormuz|detroit d'ormuz|venture|startup valuation|marché|market)\b/i.test(text)) {
+    return false;
+  }
+
+  return /\b(science|physique|physics|quantum|quantique|astro|space|espace|cosmolog|neuro|biology|biologie|bio|medicine|médecine|medical|crispr|gene|protein|chem|chimie|materials|matériaux|climate|climat|earth|terre|robotique|robotics|fusion|ocean|océan|cell|genom|fongique|fungal)\b/i.test(text);
+}
+
+function extractBriefSection(summary: string | null, label: string): string | null {
+  if (!summary) return null;
+  const pattern = new RegExp(`${label}\\s*:\\s*([\\s\\S]*?)(?=\\n\\n[A-ZÀ-Ÿ][^\\n:]{1,48}\\s*:|$)`, 'i');
+  const match = summary.match(pattern);
+  const text = match?.[1]?.replace(/\s+/g, ' ').trim();
+  return text && text.length >= 20 ? text.slice(0, 900) : null;
+}
+
+function sourceDomain(sourceName: string): string {
+  const name = sourceName.trim();
+  if (/arxiv/i.test(name)) return 'preprint';
+  if (/nature|science|cell|lancet|nejm|plos/i.test(name)) return 'revue';
+  if (/quanta|science news|ars|conversation|cosmos|discover/i.test(name)) return 'décryptage';
+  if (/nasa|esa|mit|our world in data|hal/i.test(name)) return 'institution';
+  if (/grok/i.test(name)) return 'exploration web';
+  return 'science';
+}
+
+function serendipityScore(article: ScienceSerendipityArticleRow): number {
+  const text = `${article.title} ${article.title_fr ?? ''} ${article.summary_fr ?? ''}`.toLowerCase();
+  let score = 0;
+  if (article.summary_fr && article.summary_fr.length >= 700) score += 28;
+  if (/mécanisme|mechanism|concepts|pont transverse|niveau expert/i.test(article.summary_fr ?? '')) score += 18;
+  if (/surprising|unexpected|unusual|strange|mystery|quantum|black hole|neuroscience|crispr|protein|fusion|exoplanet|robotic|materials|climate|genome|cell/i.test(text)) score += 18;
+  if (/quanta|science news|nature|science|cell|lancet|nasa|biorxiv|medrxiv|chemrxiv|eartharxiv|hal|cochrane|grok/i.test(article.source_name)) score += 16;
+  if (/seminar|symposium|webinar|activities|take place|#shorts?/i.test(article.title)) score -= 60;
+  return score;
+}
+
+function scienceArticleToSerendipityCard(article: ScienceSerendipityArticleRow): Record<string, unknown> {
+  const summary = article.summary_fr ?? '';
+  const simple = extractBriefSection(summary, 'Niveau simple');
+  const mechanism = extractBriefSection(summary, 'Mécanisme') ?? extractBriefSection(summary, 'Niveau intermédiaire');
+  const soWhat = extractBriefSection(summary, 'Pourquoi ça compte') ?? extractBriefSection(summary, 'Pont transverse');
+  const concepts = extractBriefSection(summary, 'Concepts');
+  const tldr = extractBriefSection(summary, 'TL;DR');
+  const title = article.title_fr?.trim() || article.title;
+
+  return {
+    id: `science-${article.hash}`,
+    arxiv_id: null,
+    source_url: article.url,
+    domain: sourceDomain(article.source_name),
+    arxiv_category: null,
+    title_choc: title,
+    enigme: simple ?? tldr ?? article.content?.replace(/\s+/g, ' ').trim().slice(0, 280) ?? null,
+    personnage: article.source_name,
+    concept: mechanism ?? concepts,
+    so_what: soWhat,
+    paper_title: article.title,
+    authors: [],
+    published_at: article.published_at ? new Date(article.published_at).toISOString() : null,
+    created_at: new Date(article.fetched_at).toISOString(),
+    source_name: article.source_name,
+    mode: 'science_brief_fallback',
+  };
+}
+
+async function getScienceSerendipityFallback(env: Env, limit: number): Promise<Record<string, unknown>[]> {
+  const cutoff = Date.now() - 21 * 24 * 60 * 60 * 1000;
+  const { results } = await env.DB.prepare(
+    `SELECT hash, title, title_fr, source_name, url, content, summary_fr, published_at, fetched_at
+     FROM articles
+     WHERE theme = 'science'
+       AND fetched_at > ?
+       AND summary_fr IS NOT NULL
+       AND LENGTH(summary_fr) >= 420
+       AND title NOT LIKE '%Seminar%'
+       AND title NOT LIKE '%Symposium%'
+       AND title NOT LIKE '%Activities%'
+       AND title NOT LIKE '%Take Place%'
+       AND title NOT LIKE '%#shorts%'
+       AND title NOT LIKE '%#short%'
+     ORDER BY fetched_at DESC
+     LIMIT 80`,
+  ).bind(cutoff).all<ScienceSerendipityArticleRow>();
+
+  const seenDomains = new Set<string>();
+  const selected: ScienceSerendipityArticleRow[] = [];
+  const deferred: ScienceSerendipityArticleRow[] = [];
+  const ranked = results
+    .map((article) => ({ article, score: serendipityScore(article) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || b.article.fetched_at - a.article.fetched_at);
+
+  for (const { article } of ranked) {
+    const domain = sourceDomain(article.source_name);
+    if (seenDomains.has(domain)) {
+      deferred.push(article);
+      continue;
+    }
+    selected.push(article);
+    seenDomains.add(domain);
+    if (selected.length >= limit) break;
+  }
+
+  return [...selected, ...deferred].slice(0, limit).map(scienceArticleToSerendipityCard);
+}
+
+async function getSerendipity(sql: Sql, env: Env, url: URL): Promise<Response> {
   const limit = parseLimit(url, 12, 30);
   const cards = await rows<SerendipityRow>(sql`
-    SELECT id, arxiv_id, source_url, domain, arxiv_category,
-           title_choc, enigme, personnage, concept, so_what,
-           paper_title, authors, published_at, created_at
-    FROM serendipity_cards
-    WHERE status = 'active'
-    ORDER BY created_at DESC
-    LIMIT ${limit}
-  `);
+      SELECT id, arxiv_id, source_url, domain, arxiv_category,
+             title_choc, enigme, personnage, concept, so_what,
+             paper_title, authors, published_at, created_at
+      FROM serendipity_cards
+      WHERE status = 'active'
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `).catch(() => []);
 
   if (cards.length > 0) {
+    const scienceCards = cards.filter(isScientificSerendipityCard).map(normalizeSerendipityCard);
+    const fallbackCards = await getScienceSerendipityFallback(env, limit);
+    const fallbackIds = new Set(fallbackCards.map((card) => card.id));
+    const mergedCards = [
+      ...fallbackCards,
+      ...scienceCards.filter((card) => !fallbackIds.has(card.id)),
+    ].slice(0, limit);
+    if (mergedCards.length > 0) {
+      return json({
+        cards: mergedCards,
+        count: mergedCards.length,
+        source: fallbackCards.length ? 'mixed' : 'neon',
+        mode: fallbackCards.length ? 'science_mixed' : 'serendipity_cards',
+      });
+    }
+
     return json({
-      cards: cards.map(normalizeSerendipityCard),
-      count: cards.length,
+      cards: [],
+      count: 0,
       source: 'neon',
-      mode: 'serendipity_cards',
+      mode: 'empty_science_filter',
+    });
+  }
+
+  const fallbackCards = await getScienceSerendipityFallback(env, limit);
+  if (fallbackCards.length > 0) {
+    return json({
+      cards: fallbackCards,
+      count: fallbackCards.length,
+      source: 'd1',
+      mode: 'science_brief_fallback',
     });
   }
 
