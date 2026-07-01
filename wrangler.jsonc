@@ -1,41 +1,77 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "techpulse-worker",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-05-29",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
-
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "techpulse",
-      "database_id": "9dbf5d5f-1fef-488d-ab5c-5c24de9e3d95"
-    }
-  ],
-
-  "r2_buckets": [
-    { "binding": "PODCASTS", "bucket_name": "techpulse-podcasts" }
-  ],
-
-  "ai": { "binding": "AI" },
-
-  "triggers": {
-    "crons": ["*/30 * * * *", "0 */2 * * *", "0 6 * * *", "0 7 * * *", "0 6 * * 5"]
-  },
-
-  // Secrets partagés — Cloudflare Secrets Store (même store que englishfluency-worker)
-  "secrets_store_secrets": [
-    { "binding": "OPENAI_API_KEY",     "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "OPENAI_API_KEY" },
-    { "binding": "OPENROUTER_API_KEY", "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "OPENROUTER_API_KEY" },
-    { "binding": "GEMINI_API_KEY",     "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "GEMINI_API_KEY" },
-    { "binding": "GROQ_API_KEY_1",     "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "GROQ_API_KEY_1" },
-    { "binding": "GROQ_API_KEY_2",     "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "GROQ_API_KEY_2" },
-    { "binding": "DEEPSEEK_API_KEY",   "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "DEEPSEEK_API_KEY" },
-    { "binding": "XAI_API_KEY",        "store_id": "dee352e477854af6896293b6955e3824", "secret_name": "XAI_API_KEY" }
-  ]
-
-  // Secrets spécifiques à TechPulse — définis via `wrangler secret put` :
-  // API_SECRET, YOUTUBE_API_KEY_1-3, YOUTUBE_SEARCH_KEY_1-3,
-  // GROQ_TTS_KEY_1-2, HF_TOKEN, REDDIT_PROXY_URL, REDDIT_PROXY_SECRET
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "techpulse-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-05-29",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "techpulse",
+			"database_id": "9dbf5d5f-1fef-488d-ab5c-5c24de9e3d95"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "PODCASTS",
+			"bucket_name": "techpulse-podcasts"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"triggers": {
+		"crons": [
+			"30 */2 * * *",
+			"0 0 * * *",
+			"0 1 * * *",
+			"0 0 * * 5"
+		]
+	},
+	// Secrets partagés — Cloudflare Secrets Store (même store que englishfluency-worker)
+	"secrets_store_secrets": [
+		{
+			"binding": "OPENAI_API_KEY",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "OPENAI_API_KEY"
+		},
+		{
+			"binding": "OPENROUTER_API_KEY",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "OPENROUTER_API_KEY"
+		},
+		{
+			"binding": "GEMINI_API_KEY",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "GEMINI_API_KEY"
+		},
+		{
+			"binding": "GROQ_API_KEY_1",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "GROQ_API_KEY_1"
+		},
+		{
+			"binding": "GROQ_API_KEY_2",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "GROQ_API_KEY_2"
+		},
+		{
+			"binding": "DEEPSEEK_API_KEY",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "DEEPSEEK_API_KEY"
+		},
+		{
+			"binding": "XAI_API_KEY",
+			"store_id": "dee352e477854af6896293b6955e3824",
+			"secret_name": "XAI_API_KEY"
+		}
+	]
+	// Secrets spécifiques à TechPulse — définis via `wrangler secret put` :
+	// API_SECRET, YOUTUBE_API_KEY_1-3, YOUTUBE_SEARCH_KEY_1-3,
+	// GROQ_TTS_KEY_1-2, HF_TOKEN, REDDIT_PROXY_URL, REDDIT_PROXY_SECRET
 }

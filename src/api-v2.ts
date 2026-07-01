@@ -1,5 +1,6 @@
-import { neon } from '@neondatabase/serverless';
-import type { NeonQueryFunction } from '@neondatabase/serverless';
+import { neon, type NeonQueryFunction } from '@neondatabase/serverless';
+
+type Sql = NeonQueryFunction<false, false>;
 import {
   asArray,
   normalizeAnalysis,
@@ -27,7 +28,6 @@ import type { Env } from './types';
 import { getArticleFeedbackPreferenceProfile, scorePreferenceAdjustment } from './feedback';
 import { err, json } from './utils';
 
-type Sql = NeonQueryFunction<false, false>;
 type PersonalizedFeedCluster = Record<string, unknown> & {
   score: number;
   last_updated_at?: unknown;
@@ -120,23 +120,127 @@ function topicBucket(cluster: PersonalizedFeedCluster): string {
   return typeof cluster.main_theme === 'string' ? cluster.main_theme : 'general';
 }
 
-function diversifyTopClusters(clusters: PersonalizedFeedCluster[], limit: number): PersonalizedFeedCluster[] {
-  const selected: PersonalizedFeedCluster[] = [];
-  const deferred: PersonalizedFeedCluster[] = [];
-  const buckets = new Set<string>();
-  const protectedWindow = Math.min(limit, 8);
+// ─── MMR (Maximal Marginal Relevance) + quotas par domaine ───────────────────
+// Implémente la stratégie décrite dans vison.txt :
+// 1. Sélection itérative qui maximise λ×pertinence − (1−λ)×similarité_max
+// 2. Quotas par domaine (éviter qu'un domaine domine)
+// 3. 2e passe souple pour combler les slots restants
 
-  for (const cluster of clusters) {
-    const bucket = topicBucket(cluster);
-    if (selected.length < protectedWindow && buckets.has(bucket)) {
-      deferred.push(cluster);
-      continue;
+const MMR_LAMBDA = 0.7; // 70% pertinence, 30% diversité
+const DOMAIN_QUOTA = 4; // max 4 clusters par domaine dans le feed
+const PROTECTED_WINDOW = 8; // fenêtre initiale stricte
+
+function clusterKeywords(cluster: PersonalizedFeedCluster): Set<string> {
+  const text = [
+    typeof cluster.title === 'string' ? cluster.title : '',
+    typeof cluster.summary === 'string' ? cluster.summary : '',
+    typeof cluster.main_theme === 'string' ? cluster.main_theme : '',
+  ].join(' ').toLowerCase();
+
+  // Extraire les mots significatifs (≥4 chars, sans stopwords)
+  const stop = new Set(['the', 'this', 'that', 'with', 'from', 'have', 'they', 'will',
+    'about', 'after', 'into', 'your', 'their', 'what', 'when', 'where',
+    'more', 'than', 'only', 'also', 'been', 'were', 'some', 'very',
+    'pour', 'avec', 'dans', 'pour', 'sont', 'une', 'des', 'les', 'sur']);
+
+  return new Set(
+    text.match(/[a-zà-ÿ]{4,}/g)?.filter((w) => !stop.has(w)) ?? [],
+  );
+}
+
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let intersection = 0;
+  for (const word of a) {
+    if (b.has(word)) intersection++;
+  }
+  return intersection / (a.size + b.size - intersection);
+}
+
+function clusterDomain(cluster: PersonalizedFeedCluster): string {
+  return topicBucket(cluster);
+}
+
+/**
+ * MMR : sélection itérative qui équilibre pertinence et diversité.
+ * À chaque étape, on choisit le cluster qui maximise :
+ *   λ × score_normalisé − (1−λ) × similarité_max_avec_les_sélectionnés
+ */
+function selectWithMMR(
+  candidates: PersonalizedFeedCluster[],
+  limit: number,
+): PersonalizedFeedCluster[] {
+  if (candidates.length <= limit) return candidates;
+
+  // Normaliser les scores sur [0, 1]
+  const scores = candidates.map((c) => parseNumber(c.score));
+  const maxScore = Math.max(...scores, 1);
+  const minScore = Math.min(...scores, 0);
+  const scoreRange = maxScore - minScore || 1;
+
+  // Précalculer les keywords pour chaque cluster
+  const keywords = candidates.map((c) => clusterKeywords(c));
+
+  const selected: number[] = [];
+  const selectedKeywords: Set<string>[] = [];
+  const domainCounts: Record<string, number> = {};
+  const deferred: number[] = [];
+
+  while (selected.length < limit && (selected.length + deferred.length < candidates.length)) {
+    let bestIdx = -1;
+    let bestMmr = -Infinity;
+
+    for (let i = 0; i < candidates.length; i++) {
+      if (selected.includes(i)) continue;
+
+      const domain = clusterDomain(candidates[i]!);
+
+      // Quota par domaine : skip si déjà atteint dans la fenêtre protégée
+      if (selected.length < PROTECTED_WINDOW && (domainCounts[domain] ?? 0) >= DOMAIN_QUOTA) {
+        if (!deferred.includes(i)) deferred.push(i);
+        continue;
+      }
+
+      // Pertinence normalisée [0, 1]
+      const relevance = (scores[i]! - minScore) / scoreRange;
+
+      // Similarité max avec les clusters déjà sélectionnés
+      let maxSim = 0;
+      for (const sk of selectedKeywords) {
+        const sim = jaccardSimilarity(keywords[i]!, sk);
+        if (sim > maxSim) maxSim = sim;
+      }
+
+      // Score MMR
+      const mmr = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * maxSim;
+
+      if (mmr > bestMmr) {
+        bestMmr = mmr;
+        bestIdx = i;
+      }
     }
-    selected.push(cluster);
-    buckets.add(bucket);
+
+    if (bestIdx === -1) {
+      // Tous les candidats restants sont deferred (quota atteint)
+      // 2e passe souple : relâcher les quotas pour combler
+      for (const i of deferred) {
+        if (selected.length >= limit) break;
+        const domain = clusterDomain(candidates[i]!);
+        if ((domainCounts[domain] ?? 0) >= DOMAIN_QUOTA + 2) continue; // limite absolue
+        selected.push(i);
+        selectedKeywords.push(keywords[i]!);
+        domainCounts[domain] = (domainCounts[domain] ?? 0) + 1;
+      }
+      break;
+    }
+
+    selected.push(bestIdx);
+    selectedKeywords.push(keywords[bestIdx]!);
+    domainCounts[clusterDomain(candidates[bestIdx]!)] =
+      (domainCounts[clusterDomain(candidates[bestIdx]!)] ?? 0) + 1;
   }
 
-  return [...selected, ...deferred].slice(0, limit);
+  return selected.map((i) => candidates[i]!);
 }
 
 function applyTopicSaturation(clusters: PersonalizedFeedCluster[]): PersonalizedFeedCluster[] {
@@ -182,10 +286,11 @@ function applyTopicSaturation(clusters: PersonalizedFeedCluster[]): Personalized
 }
 
 function getSql(env: Env): Sql | Response {
-  if (!env.NEON_DATABASE_URL) {
-    return err('NEON_DATABASE_URL non configuré', 503);
+  const dbUrl = env.DATABASE_URL ?? env.NEON_DATABASE_URL;
+  if (!dbUrl) {
+    return err('DATABASE_URL non configuré', 503);
   }
-  return neon(env.NEON_DATABASE_URL);
+  return neon(dbUrl, { arrayMode: false, fullResults: false });
 }
 
 async function rows<T>(query: Promise<unknown>): Promise<T[]> {
@@ -198,6 +303,71 @@ function parseLimit(url: URL, defaultValue: number, max: number): number {
   return Math.max(1, Math.min(Math.trunc(raw), max));
 }
 
+// ─── D1 Cache (réduit le data transfer Neon) ──────────────────────────────────
+
+const CACHE_TTL: Record<string, number> = {
+  '/api/v2/feed': 600,           // 10 min (était 5 min)
+  '/api/v2/preferences': 600,    // 10 min (était 5 min)
+  '/api/v2/entities': 3600,      // 1h (était 30 min)
+  '/api/v2/signals': 1800,       // 30 min (était 15 min)
+  '/api/v2/podcast-moments': 7200, // 2h (était 1h)
+  '/api/v2/concepts': 7200,      // 2h (était 1h)
+  '/api/v2/predictions': 3600,   // 1h
+  '/api/v2/search': 300,         // 5 min (dépend de la query)
+  '/api/v2/serendipity': 7200,   // 2h (était 1h)
+  // Routes avec ID : TTL plus long (le contenu change peu)
+  '/api/v2/cluster/': 1800,      // 30 min (était 10 min)
+  '/api/v2/article/': 3600,      // 1h (était 30 min)
+  '/api/v2/entity/': 3600,       // 1h (était 30 min)
+};
+
+function getCacheTtl(path: string): number {
+  // Routes avec préfixe (cluster/, article/, entity/)
+  for (const [prefix, ttl] of Object.entries(CACHE_TTL)) {
+    if (prefix.endsWith('/') && path.startsWith(prefix)) return ttl;
+  }
+  return CACHE_TTL[path] ?? 300;
+}
+
+function getCacheKey(path: string): string {
+  // Pour les routes avec query params, inclure les params principaux dans la clé
+  return path.replace(/[^a-zA-Z0-9/_-]/g, '_').slice(0, 200);
+}
+
+async function getCachedResponse(env: Env, cacheKey: string): Promise<string | null> {
+  try {
+    const row = await env.DB.prepare(
+      'SELECT value FROM api_cache WHERE key = ? AND expires_at > ?'
+    ).bind(cacheKey, Date.now()).first<{ value: string }>();
+
+    // Nettoyage opportun : supprimer les entrées expirées (~1 fois sur 100)
+    if (Math.random() < 0.01) {
+      try {
+        await env.DB.prepare('DELETE FROM api_cache WHERE expires_at < ?').bind(Date.now()).run();
+      } catch { /* best-effort */ }
+    }
+
+    return row?.value ?? null;
+  } catch {
+    // Table n'existe pas encore — créer silencieusement
+    try {
+      await env.DB.prepare(
+        'CREATE TABLE IF NOT EXISTS api_cache (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER, created_at INTEGER)'
+      ).run();
+    } catch { /* ignore */ }
+    return null;
+  }
+}
+
+async function setCachedResponse(env: Env, cacheKey: string, value: string, ttlSec: number): Promise<void> {
+  try {
+    const expiresAt = Date.now() + ttlSec * 1000;
+    await env.DB.prepare(
+      'INSERT OR REPLACE INTO api_cache (key, value, expires_at, created_at) VALUES (?, ?, ?, ?)'
+    ).bind(cacheKey, value, expiresAt, Date.now()).run();
+  } catch { /* best-effort */ }
+}
+
 export async function handleApiV2(req: Request, env: Env): Promise<Response | null> {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -205,54 +375,81 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
   if (!path.startsWith('/api/v2/')) return null;
   if (req.method !== 'GET') return err('Méthode non autorisée', 405);
 
+  // ─── Vérifier le cache D1 ───
+  const cacheKey = getCacheKey(path + url.search);
+  const ttl = getCacheTtl(path);
+
+  if (ttl > 0) {
+    const cached = await getCachedResponse(env, cacheKey);
+    if (cached) {
+      // Retourner la réponse cachée avec un header pour le debug
+      return new Response(cached, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Cache': 'HIT',
+        },
+      });
+    }
+  }
+
+  // ─── Pas de cache → lire Neon ───
   const sqlOrResponse = getSql(env);
   if (sqlOrResponse instanceof Response) return sqlOrResponse;
   const sql = sqlOrResponse;
 
   try {
+    let response: Response;
+
     if (path === '/api/v2/feed') {
-      return getFeed(sql, env, url);
-    }
-
-    if (path === '/api/v2/preferences') {
-      return getPreferences(env);
-    }
-
-    if (path.startsWith('/api/v2/cluster/')) {
+      response = await getFeed(sql, env, url);
+    } else if (path === '/api/v2/preferences') {
+      response = await getPreferences(env);
+    } else if (path.startsWith('/api/v2/cluster/')) {
       const id = decodeURIComponent(path.slice('/api/v2/cluster/'.length)).trim();
       if (!id) return err('ID cluster requis');
-      return getClusterDetail(sql, id);
-    }
-
-    if (path.startsWith('/api/v2/article/')) {
+      response = await getClusterDetail(sql, id);
+    } else if (path.startsWith('/api/v2/article/')) {
       const id = decodeURIComponent(path.slice('/api/v2/article/'.length)).trim();
       if (!id) return err('ID article requis');
-      return getArticleDetail(sql, id);
-    }
-
-    if (path.startsWith('/api/v2/entity/') && path.endsWith('/graph')) {
+      response = await getArticleDetail(sql, id);
+    } else if (path.startsWith('/api/v2/entity/') && path.endsWith('/graph')) {
       const rawId = path.slice('/api/v2/entity/'.length, -'/graph'.length);
       const id = decodeURIComponent(rawId).trim();
       if (!id) return err('ID entité requis');
-      return getEntityGraph(sql, id, url);
+      response = await getEntityGraph(sql, id, url);
+    } else if (path === '/api/v2/entities') {
+      response = await getEntities(sql, url);
+    } else if (path === '/api/v2/signals') {
+      response = await getSignals(sql, url);
+    } else if (path === '/api/v2/podcast-moments') {
+      response = await getPodcastMoments(sql, url);
+    } else if (path === '/api/v2/concepts') {
+      response = await getConcepts(sql, url);
+    } else if (path === '/api/v2/predictions') {
+      response = await getPredictions(sql, url);
+    } else if (path === '/api/v2/search') {
+      response = await searchNeon(sql, url);
+    } else if (path === '/api/v2/serendipity') {
+      response = await getSerendipity(sql, env, url);
+    } else {
+      return err('Route API v2 inconnue', 404);
     }
 
-    if (path === '/api/v2/entities') {
-      return getEntities(sql, url);
+    // ─── Cacher la réponse si elle est OK ───
+    if (response.ok && ttl > 0) {
+      try {
+        const text = await response.clone().text();
+        if (text.length < 500_000) { // Ne pas cacher les très grosses réponses (>500KB)
+          await setCachedResponse(env, cacheKey, text, ttl);
+        }
+      } catch { /* best-effort */ }
     }
 
-    if (path === '/api/v2/signals') {
-      return getSignals(sql, url);
-    }
-
-    if (path === '/api/v2/serendipity') {
-      return getSerendipity(sql, env, url);
-    }
-
-    return err('Route API v2 inconnue', 404);
+    return response;
   } catch (error) {
-    console.error('[api-v2] Neon query failed', error);
-    return err('Erreur de lecture Neon', 500);
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error('[api-v2] Database query failed:', msg);
+    return err(`Erreur de lecture base de données: ${msg.slice(0, 200)}`, 500);
   }
 }
 
@@ -408,7 +605,7 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
       const rightDate = typeof right.last_updated_at === 'string' ? Date.parse(right.last_updated_at) : 0;
       return rightDate - leftDate;
     });
-  const clusters = diversifyTopClusters(scoredClusters, limit);
+  const clusters = selectWithMMR(scoredClusters, limit);
 
   return json({
     clusters,
@@ -515,6 +712,7 @@ async function getArticleDetail(sql: Sql, articleId: string): Promise<Response> 
            a.llm_enriched_at, a.llm_enrichment_model, a.extraction_method,
            a.extracted_at, a.embedded_at, a.embedding_model, a.embedding_dimensions,
            a.internal_score, a.created_at,
+           a.audio_url, a.audio_duration,
            NULL::text AS role, NULL::float AS similarity_score
     FROM articles a
     WHERE a.id = ${articleId}
@@ -574,11 +772,26 @@ async function getArticleDetail(sql: Sql, articleId: string): Promise<Response> 
     `),
   ]);
 
+  // Podcast moments (if this article is a podcast with extracted moments)
+  const podcastMoments = article.source_type === 'podcast'
+    ? await rows<AnalysisRow>(sql`
+        SELECT id, target_type, target_id, model_provider, model_name,
+               analysis_type, content, tokens_used, cost_estimate, created_at
+        FROM ai_analyses
+        WHERE target_type = 'article'
+          AND target_id = ${articleId}
+          AND analysis_type = 'podcast_moments'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `)
+    : [];
+
   return json({
     article: normalizeArticleDetail(article),
     intelligence: intelligence[0] ? normalizeArticleIntelligence(intelligence[0]) : null,
     clusters: clusters.map(normalizeCluster),
     entities: entities.map(normalizeEntity),
+    podcast_moments: podcastMoments[0] ? normalizeAnalysis(podcastMoments[0]) : null,
     source: 'neon',
   });
 }
@@ -994,5 +1207,239 @@ async function getSerendipity(sql: Sql, env: Env, url: URL): Promise<Response> {
     count: 0,
     source: 'neon',
     mode: 'empty',
+  });
+}
+
+// ─── Concepts dynamiques (Phase E — Comprendre l'IA) ──────────────────────────
+
+interface ConceptRow {
+  concept: string;
+  explanation: string | null;
+  domain: string | null;
+  source_article_id: string;
+  source_title: string;
+  source_name: string;
+  source_type: string;
+  article_url: string | null;
+  created_at: string | Date;
+}
+
+// ─── Recherche sémantique/full-text dans Neon ─────────────────────────────────
+
+async function searchNeon(sql: Sql, url: URL): Promise<Response> {
+  const q = (url.searchParams.get('q') ?? '').trim();
+  if (q.length < 2) return json({ results: { clusters: [], articles: [], entities: [] }, count: 0, query: q, source: 'neon' });
+
+  const limit = parseLimit(url, 20, 50);
+  const ilikePattern = '%' + q + '%';
+
+  // Recherche full-text sur les clusters
+  const clusters = await rows<ClusterRow>(sql`
+    SELECT c.id, c.title, c.summary, c.main_theme, c.status,
+           c.importance_score, c.growth_score, c.novelty_score,
+           c.article_count, c.first_seen_at, c.last_updated_at
+    FROM clusters c
+    WHERE c.status IN ('active', 'growing', 'peak')
+      AND (
+        c.title ILIKE ${ilikePattern}
+        OR c.summary ILIKE ${ilikePattern}
+        OR c.main_theme ILIKE ${ilikePattern}
+      )
+    ORDER BY c.importance_score DESC, c.last_updated_at DESC
+    LIMIT ${limit}
+  `);
+
+  // Recherche sur les articles
+  const articles = await rows<ArticleRow>(sql`
+    SELECT a.id, a.title, a.description, a.source_name, a.source_type,
+           a.url, a.image_url, a.published_at
+    FROM articles a
+    WHERE a.title ILIKE ${ilikePattern}
+       OR a.description ILIKE ${ilikePattern}
+    ORDER BY a.published_at DESC NULLS LAST
+    LIMIT ${limit}
+  `);
+
+  // Recherche sur les entités
+  const entities = await rows<EntityRow>(sql`
+    SELECT e.id, e.name, e.type, e.description,
+           e.mentions_count, e.trend_score
+    FROM entities e
+    WHERE e.name ILIKE ${ilikePattern}
+       OR e.description ILIKE ${ilikePattern}
+    ORDER BY e.trend_score DESC, e.mentions_count DESC
+    LIMIT ${Math.min(limit, 10)}
+  `);
+
+  return json({
+    results: {
+      clusters: clusters.map((c) => normalizeCluster(c)),
+      articles: articles.map(normalizeArticle),
+      entities: entities.map(normalizeEntity),
+    },
+    count: clusters.length + articles.length + entities.length,
+    query: q,
+    source: 'neon',
+  });
+}
+
+// ─── Prédictions (suivi dans le temps) ────────────────────────────────────────
+
+async function getPredictions(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 20, 100);
+  const status = url.searchParams.get('status')?.trim() || null;
+  const domain = url.searchParams.get('domain')?.trim().toLowerCase() || null;
+  const sinceDays = Math.max(1, Math.min(Number(url.searchParams.get('since_days') ?? '30'), 365));
+
+  const result = await rows(sql`
+    SELECT id, prediction, horizon, confidence, source_type, source_id,
+           source_title, source_name, speaker, domain, status,
+           resolved_at, resolution_notes, created_at, updated_at
+    FROM predictions
+    ${status ? sql`WHERE status = ${status}` : sql``}
+    ${domain ? (status ? sql`AND domain = ${domain}` : sql`WHERE domain = ${domain}`) : sql``}
+    AND created_at > NOW() - (${sinceDays} || ' days')::interval
+    ORDER BY
+      CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+      created_at DESC
+    LIMIT ${limit}
+  `);
+
+  return json({
+    predictions: result,
+    count: result.length,
+    source: 'neon',
+  });
+}
+
+async function getConcepts(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 30, 100);
+  const sinceHours = Math.max(1, Math.min(Number(url.searchParams.get('since_hours') ?? '168'), 720));
+  const domain = url.searchParams.get('domain')?.trim().toLowerCase() || null;
+
+  // Source 1 : concepts extraits des podcasts (ai_analyses podcast_moments → content.concepts_explained)
+  const podcastConcepts = await sql`
+    SELECT
+      je.concept AS concept,
+      je.explanation AS explanation,
+      je.domain AS domain,
+      a.id AS source_article_id,
+      a.title AS source_title,
+      a.source_name AS source_name,
+      a.source_type AS source_type,
+      a.url AS article_url,
+      aa.created_at AS created_at
+    FROM ai_analyses aa
+    JOIN articles a ON a.id = aa.target_id
+    JOIN LATERAL jsonb_array_elements(aa.content->'concepts_explained') AS je ON true
+    WHERE aa.target_type = 'article'
+      AND aa.analysis_type = 'podcast_moments'
+      AND a.source_type = 'podcast'
+      AND aa.created_at > NOW() - (${sinceHours} || ' hours')::interval
+  ` as ConceptRow[];
+
+  // Source 2 : entités de type 'concept' extraites par article_intelligence
+  const articleConcepts = await sql`
+    SELECT
+      ent.name AS concept,
+      NULL::text AS explanation,
+      ai.primary_domain AS domain,
+      a.id AS source_article_id,
+      a.title AS source_title,
+      a.source_name AS source_name,
+      a.source_type AS source_type,
+      a.url AS article_url,
+      ai.updated_at AS created_at
+    FROM article_intelligence ai
+    JOIN articles a ON a.id = ai.article_id
+    JOIN LATERAL jsonb_array_elements(ai.entities) AS ent ON true
+    WHERE ent->>'type' = 'concept'
+      AND ent->>'role' = 'main'
+      AND ai.updated_at > NOW() - (${sinceHours} || ' hours')::interval
+  ` as ConceptRow[];
+
+  // Fusion + dédoublonnage par nom normalisé
+  const allConcepts = [...podcastConcepts, ...articleConcepts];
+  const byKey = new Map<string, ConceptRow>();
+
+  for (const row of allConcepts) {
+    const key = (row.concept || '').toLowerCase().trim().slice(0, 80);
+    if (!key) continue;
+
+    // Filtrer par domaine si demandé
+    if (domain && (row.domain || '').toLowerCase() !== domain) continue;
+
+    const existing = byKey.get(key);
+    // Garder la version avec une explication (podcast) plutôt que sans (article)
+    if (!existing || (!existing.explanation && row.explanation)) {
+      byKey.set(key, row);
+    }
+  }
+
+  // Trier par récence puis limiter
+  const concepts = Array.from(byKey.values())
+    .sort((a, b) => {
+      const ta = a.created_at instanceof Date ? a.created_at.getTime() : Date.parse(String(a.created_at));
+      const tb = b.created_at instanceof Date ? b.created_at.getTime() : Date.parse(String(b.created_at));
+      return tb - ta;
+    })
+    .slice(0, limit);
+
+  return json({
+    concepts: concepts.map((row) => ({
+      concept: row.concept,
+      explanation: row.explanation,
+      domain: row.domain,
+      source: {
+        article_id: row.source_article_id,
+        title: row.source_title,
+        source_name: row.source_name,
+        source_type: row.source_type,
+        url: row.article_url,
+      },
+      created_at: toIso(row.created_at),
+    })),
+    count: concepts.length,
+    source: 'neon',
+  });
+}
+
+// ─── Podcast moments (Phase E) ────────────────────────────────────────────────
+
+async function getPodcastMoments(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 10, 50);
+  const sinceHours = Math.max(1, Math.min(Number(url.searchParams.get('since_hours') ?? '72'), 168));
+
+  const moments = await rows<AnalysisRow>(sql`
+    SELECT aa.id, aa.target_id, aa.content, aa.created_at,
+           a.title AS article_title, a.source_name, a.url AS article_url,
+           a.audio_url, a.audio_duration, a.image_url
+    FROM ai_analyses aa
+    JOIN articles a ON a.id = aa.target_id
+    WHERE aa.target_type = 'article'
+      AND aa.analysis_type = 'podcast_moments'
+      AND a.source_type = 'podcast'
+      AND aa.created_at > NOW() - (${sinceHours} || ' hours')::interval
+    ORDER BY aa.created_at DESC
+    LIMIT ${limit}
+  `);
+
+  const mapped = moments.map((row) => ({
+    ...normalizeAnalysis(row),
+    article: {
+      id: row.target_id,
+      title: (row as { article_title?: string }).article_title ?? null,
+      source_name: (row as { source_name?: string }).source_name ?? null,
+      url: (row as { article_url?: string }).article_url ?? null,
+      audio_url: (row as { audio_url?: string | null }).audio_url ?? null,
+      audio_duration: parseNumber((row as { audio_duration?: string | number | null }).audio_duration),
+      image_url: (row as { image_url?: string | null }).image_url ?? null,
+    },
+  }));
+
+  return json({
+    moments: mapped,
+    count: mapped.length,
+    source: 'neon',
   });
 }

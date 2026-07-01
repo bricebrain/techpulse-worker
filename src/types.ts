@@ -92,6 +92,7 @@ export interface Env {
   RUNPOD_API_KEY?: string;
   RUNPOD_AI_ENDPOINT_ID?: string;
   NEON_DATABASE_URL?: string;
+  DATABASE_URL?: string; // Fallback alternatif (Supabase ou autre)
   PODCASTS?: R2Bucket;
 }
 
@@ -99,7 +100,7 @@ export interface Source {
   id: string;
   name: string;
   theme: string;
-  type: 'rss' | 'hackernews_rss' | 'reddit_rss' | 'devto_tag' | 'youtube_channel' | 'arxiv' | 'grok_live';
+  type: 'rss' | 'hackernews_rss' | 'reddit_rss' | 'devto_tag' | 'youtube_channel' | 'arxiv' | 'grok_live' | 'podcast_rss';
   value: string;
   limit_count: number;
   is_active: number;
@@ -117,4 +118,8 @@ export interface Article {
   content: string | null;
   published_at: number | null;
   fetched_at: number;
+  /** URL du fichier audio pour les épisodes podcast (null pour les articles classiques). */
+  audio_url?: string | null;
+  /** Durée estimée en secondes (pour les podcasts). */
+  audio_duration?: number | null;
 }

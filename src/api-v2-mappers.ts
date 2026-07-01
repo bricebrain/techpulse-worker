@@ -85,6 +85,8 @@ export function normalizeArticleDetail(row: ArticleDetailRow): JsonRecord {
     embedding_model: row.embedding_model,
     embedding_dimensions: parseNumber(row.embedding_dimensions),
     internal_score: parseNumber(row.internal_score),
+    audio_url: row.audio_url,
+    audio_duration: parseNumber(row.audio_duration),
     created_at: toIso(row.created_at),
   };
 }

@@ -1,5 +1,4 @@
-import { neon } from '@neondatabase/serverless';
-import type { NeonQueryFunction } from '@neondatabase/serverless';
+import { neon, type NeonQueryFunction } from '@neondatabase/serverless';
 
 import type { Env } from './types';
 import { err, json } from './utils';
@@ -203,11 +202,12 @@ async function getPipelineJobs(sql: Sql) {
 }
 
 export async function getNeonAdminStatus(env: Env): Promise<Response> {
-  if (!env.NEON_DATABASE_URL) {
-    return err('NEON_DATABASE_URL non configuré', 503);
+  const dbUrl = env.DATABASE_URL ?? env.NEON_DATABASE_URL;
+  if (!dbUrl) {
+    return err('DATABASE_URL non configuré', 503);
   }
 
-  const sql = neon(env.NEON_DATABASE_URL);
+  const sql = neon(dbUrl, { arrayMode: false, fullResults: false });
   const generatedAt = new Date().toISOString();
 
   try {
@@ -247,14 +247,15 @@ export async function resetRecentNeonAnalyses(
   env: Env,
   options: { days?: number; articleLimit?: number; clusterLimit?: number } = {},
 ): Promise<Response> {
-  if (!env.NEON_DATABASE_URL) {
-    return err('NEON_DATABASE_URL non configuré', 503);
+  const dbUrl = env.DATABASE_URL ?? env.NEON_DATABASE_URL;
+  if (!dbUrl) {
+    return err('DATABASE_URL non configuré', 503);
   }
 
   const days = Math.max(1, Math.min(options.days ?? 7, 14));
   const articleLimit = Math.max(1, Math.min(options.articleLimit ?? 80, 200));
   const clusterLimit = Math.max(1, Math.min(options.clusterLimit ?? 20, 50));
-  const sql = neon(env.NEON_DATABASE_URL);
+  const sql = neon(dbUrl, { arrayMode: false, fullResults: false });
 
   try {
     const [result] = await rows<{

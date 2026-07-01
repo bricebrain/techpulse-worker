@@ -1,5 +1,5 @@
 import type { Env, Source } from './types';
-import { runCronFetch, runCronEnrich, runCron, fetchAndStoreSource, sendTestPushAlert } from './cron';
+import { runCronFetch, runCronEnrich, runCron, fetchAndStoreSource, sendTestPushAlert, dispatchSignalPushAlerts } from './cron';
 import { generateDailyPodcast, generateDeepDivePodcast } from './podcast';
 import { generateSuggestions } from './suggester';
 import type { DbSuggestion } from './suggester';
@@ -82,6 +82,18 @@ export default {
       // allowlist de chemins POST vers les providers réellement utilisés.
       const pathAfterProxy = path.slice('/proxy/'.length); // "openai/v1/chat/completions"
       return handleProxy(req, env, pathAfterProxy);
+    }
+
+    // ── POST /api/v2/cache/purge — vider le cache API v2 (avant handleApiV2) ──
+    // À appeler après un run pipeline pour forcer le rafraîchissement
+    if (method === 'POST' && path === '/api/v2/cache/purge') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      try {
+        await env.DB.prepare('DELETE FROM api_cache').run();
+        return json({ purged: true });
+      } catch {
+        return json({ purged: false, error: 'table may not exist yet' });
+      }
     }
 
     const apiV2Response = await handleApiV2(req, env);
@@ -248,7 +260,8 @@ export default {
       //   - Article classifié (classified_theme IS NOT NULL) → vérifié comme tech/finance
       //   - OU très récent (< 2h) et non encore classifié → pas encore passé à l'enrichissement
       const { results } = await env.DB.prepare(
-        `SELECT hash, theme, title, title_fr, source_name, url, content, summary_fr, published_at, fetched_at
+        `SELECT hash, theme, title, title_fr, source_name, url, content, summary_fr,
+                published_at, fetched_at, audio_url, audio_duration
          FROM articles
          WHERE published_at > ?
            AND (classified_theme IS NOT NULL OR fetched_at > ?)
@@ -429,9 +442,21 @@ export default {
       return json({ ingested: stmts.length });
     }
 
-    // ── POST /devices/register — enregistrer token push + keywords ────────
+    // ── POST /devices/register — enregistrer token push + préférences ──────
     if (method === 'POST' && path === '/devices/register') {
-      const body = await req.json<{ token?: string; platform?: string; keywords?: string[] }>().catch(() => null);
+      const body = await req.json<{
+        token?: string;
+        platform?: string;
+        keywords?: string[];
+        preferences?: {
+          podcasts?: boolean;
+          signals?: boolean;
+          entities?: boolean;
+          keywords?: boolean;
+          quietHours?: { start: string; end: string } | null;
+          dailyCap?: number;
+        };
+      }>().catch(() => null);
       if (!body?.token) return err('token requis');
       const token = body.token.trim();
       if (token.length < 16 || token.length > 4096) return err('token invalide');
@@ -445,11 +470,25 @@ export default {
       );
       const platform = (body.platform ?? 'unknown').trim().slice(0, 32) || 'unknown';
 
+      // Préférences granulaires (backward compat : défaut tout activé)
+      const prefs = body.preferences ?? {};
+      const preferences = JSON.stringify({
+        podcasts: prefs.podcasts ?? true,
+        signals: prefs.signals ?? true,
+        entities: prefs.entities ?? true,
+        keywords: prefs.keywords ?? true,
+        quietHours: prefs.quietHours ?? null,
+        dailyCap: typeof prefs.dailyCap === 'number' ? Math.min(Math.max(prefs.dailyCap, 0), 20) : 5,
+      });
+
       await env.DB.prepare(
-        `INSERT INTO devices (token, platform, keywords, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(token) DO UPDATE SET keywords = excluded.keywords, updated_at = excluded.updated_at`
-      ).bind(token, platform, keywords, now, now).run();
+        `INSERT INTO devices (token, platform, keywords, preferences, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(token) DO UPDATE SET
+           keywords = excluded.keywords,
+           preferences = excluded.preferences,
+           updated_at = excluded.updated_at`
+      ).bind(token, platform, keywords, preferences, now, now).run();
 
       return json({ registered: true });
     }
@@ -472,6 +511,8 @@ export default {
         body?: string;
         theme?: string;
         hash?: string;
+        type?: 'podcast' | 'cluster' | 'entity' | 'signal' | 'article';
+        targetId?: string;
       }>().catch(() => null);
 
       let token = body?.token?.trim() ?? '';
@@ -486,20 +527,59 @@ export default {
         return err('Aucun token device exploitable trouvé', 404);
       }
 
+      // Construit le data payload selon le type de deep link visé
+      const type = body?.type ?? 'article';
+      const data: Record<string, string> = { type };
+      if (type === 'podcast') {
+        data.format = 'daily';
+      } else if (type === 'cluster' || type === 'entity' || type === 'signal' || type === 'article') {
+        data.id = body?.targetId ?? 'test-id';
+        data.theme = body?.theme?.trim() || 'ai';
+        data.hash = body?.hash?.trim() || 'push-test';
+      }
+
       const responses = await sendTestPushAlert(token, {
         title: body?.title,
         body: body?.body,
-        data: {
-          theme: body?.theme?.trim() || 'ai',
-          hash: body?.hash?.trim() || 'push-test',
-        },
+        data,
       });
 
       return json({
         sent: true,
         token,
+        type,
         responses,
       });
+    }
+
+    // ── POST /push/signals/dispatch — webhook appelé par le pipeline intelligence ─
+    // Après un run intelligence, le pipeline appelle cette route pour déclencher
+    // l'envoi de notifications sur les signaux faibles émergents.
+    // Auth : API_SECRET (même que les autres routes admin).
+    if (method === 'POST' && path === '/push/signals/dispatch') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+
+      // Créer la table push_dispatch_log si elle n'existe pas (idempotent)
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS push_dispatch_log (
+          id TEXT NOT NULL PRIMARY KEY,
+          token TEXT NOT NULL,
+          category TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          title TEXT,
+          created_at TEXT NOT NULL
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_push_dispatch_token_time ON push_dispatch_log(token, created_at)`
+      ).run();
+
+      const result = await dispatchSignalPushAlerts(env);
+
+      // Purger le cache API v2 après un run intelligence (les données ont changé)
+      try { await env.DB.prepare('DELETE FROM api_cache').run(); } catch { /* best-effort */ }
+
+      return json({ dispatched: true, ...result });
     }
 
     // ── POST /cron/trigger — déclencher le cron fetch manuellement ───────

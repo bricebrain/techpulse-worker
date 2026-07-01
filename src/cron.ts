@@ -3,10 +3,12 @@ import { fetchRss } from './fetchers/rss';
 import { fetchReddit } from './fetchers/reddit';
 import { fetchYoutube, pickYoutubeKey } from './fetchers/youtube';
 import { fetchGrokLive } from './fetchers/grok';
+import { fetchPodcast } from './fetchers/podcast';
 // Neon sync removed — handled by GitHub Actions ingest pipeline
 // which reads from Worker API and writes to Neon directly.
 import { classifyAndStore } from './classifier';
 import { enrichScienceArticles } from './scienceEnricher';
+import { neon } from '@neondatabase/serverless';
 
 const ARTICLE_TTL_DAYS = 7;
 const MAX_SOURCES_PER_FETCH_CRON = 28;
@@ -312,16 +314,49 @@ export async function sendTestPushAlert(
 
 async function dispatchPushAlerts(newArticles: Article[], env: Env): Promise<void> {
   const { results: devices } = await env.DB.prepare(
-    'SELECT token, keywords FROM devices'
-  ).all<{ token: string; keywords: string }>();
+    'SELECT token, keywords, preferences FROM devices'
+  ).all<{ token: string; keywords: string; preferences: string | null }>();
 
   if (!devices.length) return;
 
   const messages: PushMessage[] = [];
 
+  // Heure courante (UTC) — approximation pour quietHours (phase 1)
+  const nowUtc = new Date();
+  const currentUtcHour = nowUtc.getUTCHours();
+
   for (const device of devices) {
     let keywords: string[] = [];
     try { keywords = JSON.parse(device.keywords); } catch { continue; }
+
+    // Préférences granulaires (backward compat : si pas de preferences, tout true)
+    let prefs: {
+      podcasts?: boolean;
+      signals?: boolean;
+      entities?: boolean;
+      keywords?: boolean;
+      quietHours?: { start: string; end: string } | null;
+      dailyCap?: number;
+    } = { podcasts: true, signals: true, entities: true, keywords: true, quietHours: null, dailyCap: 5 };
+    if (device.preferences) {
+      try { prefs = { ...prefs, ...JSON.parse(device.preferences) }; } catch { /* garde defaults */ }
+    }
+
+    // Skip si catégorie mots-clés désactivée
+    if (prefs.keywords === false) continue;
+
+    // Skip si dans la plage silencieuse (approximation UTC)
+    if (prefs.quietHours) {
+      const startH = parseInt(prefs.quietHours.start.slice(0, 2), 10);
+      const endH = parseInt(prefs.quietHours.end.slice(0, 2), 10);
+      if (!Number.isNaN(startH) && !Number.isNaN(endH)) {
+        const inRange = startH <= endH
+          ? currentUtcHour >= startH && currentUtcHour < endH
+          : currentUtcHour >= startH || currentUtcHour < endH; // plage qui traverse minuit
+        if (inRange) continue;
+      }
+    }
+
     if (!keywords.length) continue;
 
     // Un seul article par device par run (le premier qui matche)
@@ -333,7 +368,7 @@ async function dispatchPushAlerts(newArticles: Article[], env: Env): Promise<voi
           to: device.token,
           title: `🔔 ${matched.charAt(0).toUpperCase() + matched.slice(1)}`,
           body: article.title,
-          data: { hash: article.hash, theme: article.theme },
+          data: { hash: article.hash, theme: article.theme, type: 'article' },
           channelId: 'alerts',
         });
         break; // une notif max par device par cron
@@ -390,13 +425,22 @@ export async function fetchAndStoreSource(source: Source, env: Env): Promise<voi
     const articles = await fetchSource(source, env);
     if (!articles.length) return;
 
-    const stmts = articles.map((a) =>
-      env.DB.prepare(
+    const isPodcast = source.type === 'podcast_rss';
+
+    const stmts = articles.map((a) => {
+      if (isPodcast && a.audio_url) {
+        return env.DB.prepare(
+          `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at, audio_url, audio_duration)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at, content = excluded.content, audio_url = excluded.audio_url, audio_duration = excluded.audio_duration`
+        ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at, a.audio_url, a.audio_duration ?? null);
+      }
+      return env.DB.prepare(
         `INSERT INTO articles (hash, theme, title, source_name, url, content, published_at, fetched_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(hash) DO UPDATE SET fetched_at = excluded.fetched_at, content = excluded.content`
-      ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at)
-    );
+      ).bind(a.hash, a.theme, a.title, a.source_name, a.url, a.content, a.published_at, a.fetched_at);
+    });
     await env.DB.batch(stmts);
     await classifyAndStore(env, articles);
 
@@ -431,6 +475,9 @@ async function fetchSource(source: Source, env: Env): Promise<Article[]> {
     case 'grok_live':
       return fetchGrokLive(source, env);
 
+    case 'podcast_rss':
+      return fetchPodcast(source);
+
     default:
       console.warn(`[Cron] Type non géré : ${source.type}`);
       return [];
@@ -443,4 +490,217 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
     chunks.push(arr.slice(i, i + size));
   }
   return chunks;
+}
+
+// ─── Dispatch signaux faibles (Phase 3) ───────────────────────────────────────
+
+interface EmergingSignal {
+  id: string;
+  title: string;
+  summary: string | null;
+  main_theme: string | null;
+  growth_score: number;
+  novelty_score: number;
+  importance_score: number;
+  article_count: number;
+}
+
+interface DeviceWithPrefs {
+  token: string;
+  preferences: string | null;
+}
+
+interface PushPrefs {
+  podcasts?: boolean;
+  signals?: boolean;
+  entities?: boolean;
+  keywords?: boolean;
+  quietHours?: { start: string; end: string } | null;
+  dailyCap?: number;
+}
+
+const DEFAULT_PUSH_PREFS: PushPrefs = {
+  podcasts: true,
+  signals: true,
+  entities: true,
+  keywords: true,
+  quietHours: null,
+  dailyCap: 5,
+};
+
+function parsePushPrefs(raw: string | null): PushPrefs {
+  if (!raw) return DEFAULT_PUSH_PREFS;
+  try {
+    return { ...DEFAULT_PUSH_PREFS, ...JSON.parse(raw) as PushPrefs };
+  } catch {
+    return DEFAULT_PUSH_PREFS;
+  }
+}
+
+/** Vrai si l'heure courante (UTC) tombe dans la plage silencieuse. */
+function isInQuietHours(quietHours: { start: string; end: string } | null | undefined): boolean {
+  if (!quietHours) return false;
+  const startH = parseInt(quietHours.start.slice(0, 2), 10);
+  const endH = parseInt(quietHours.end.slice(0, 2), 10);
+  if (Number.isNaN(startH) || Number.isNaN(endH)) return false;
+  const h = new Date().getUTCHours();
+  return startH <= endH
+    ? h >= startH && h < endH
+    : h >= startH || h < endH; // traverse minuit
+}
+
+/**
+ * Dispatch les signaux faibles émergents vers les devices qui ont activé
+ * prefs.signals=true. Lit Neon, filtre les déjà-notifiés via push_dispatch_log,
+ * respecte quietHours et dailyCap.
+ *
+ * Appelée par POST /push/signals/dispatch (webhook pipeline intelligence).
+ */
+export async function dispatchSignalPushAlerts(env: Env): Promise<{
+  signalsFound: number;
+  notified: number;
+  skippedDuplicate: number;
+  skippedQuiet: number;
+  skippedCap: number;
+}> {
+  const dbUrl = env.DATABASE_URL ?? env.NEON_DATABASE_URL;
+  if (!dbUrl) {
+    console.warn('[Push/Signals] DATABASE_URL non configuré — skip');
+    return { signalsFound: 0, notified: 0, skippedDuplicate: 0, skippedQuiet: 0, skippedCap: 0 };
+  }
+
+  // 1. Lire les clusters émergents récents dans la base
+  const sql = neon(dbUrl, { arrayMode: false, fullResults: false });
+  const signals = await sql`
+    SELECT c.id, c.title, c.summary, c.main_theme,
+           c.importance_score, c.growth_score, c.novelty_score,
+           c.article_count
+    FROM clusters c
+    WHERE c.status IN ('active', 'growing')
+      AND c.growth_score >= 10
+      AND c.first_seen_at > NOW() - INTERVAL '24 hours'
+    ORDER BY c.growth_score DESC, c.novelty_score DESC
+    LIMIT 5
+  ` as EmergingSignal[];
+
+  if (!signals.length) {
+    console.log('[Push/Signals] Aucun signal émergent récent');
+    return { signalsFound: 0, notified: 0, skippedDuplicate: 0, skippedQuiet: 0, skippedCap: 0 };
+  }
+
+  console.log(`[Push/Signals] ${signals.length} signaux émergents détectés`);
+
+  // 2. Récupérer les devices avec prefs.signals=true
+  const { results: devices } = await env.DB.prepare(
+    'SELECT token, preferences FROM devices'
+  ).all<DeviceWithPrefs>();
+
+  if (!devices.length) {
+    console.log('[Push/Signals] Aucun device enregistré');
+    return { signalsFound: signals.length, notified: 0, skippedDuplicate: 0, skippedQuiet: 0, skippedCap: 0 };
+  }
+
+  // 3. Pour chaque signal, vérifier quels devices n'ont pas déjà été notifiés
+  const now = new Date().toISOString();
+  const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const messages: PushMessage[] = [];
+  const logEntries: { id: string; token: string; category: string; target_id: string; title: string; created_at: string }[] = [];
+  let skippedDuplicate = 0;
+  let skippedQuiet = 0;
+  let skippedCap = 0;
+
+  for (const signal of signals) {
+    // IDs de dispatch déjà effectués pour ce signal (tous devices confondus)
+    const dispatchIds = signals.map((s) => `signal:${s.id}`);
+    const placeholders = dispatchIds.map(() => '?').join(',');
+    const { results: alreadyDispatched } = await env.DB.prepare(
+      `SELECT id FROM push_dispatch_log WHERE id IN (${placeholders})`
+    ).bind(...dispatchIds).all<{ id: string }>();
+
+    const alreadyNotifiedIds = new Set(alreadyDispatched.map((r) => r.id));
+
+    for (const device of devices) {
+      const prefs = parsePushPrefs(device.preferences);
+
+      // Skip si signaux désactivés
+      if (prefs.signals === false) continue;
+
+      // Skip si heures silencieuses
+      if (isInQuietHours(prefs.quietHours)) {
+        skippedQuiet++;
+        continue;
+      }
+
+      // Skip si déjà notifié pour ce signal
+      const dispatchId = `signal:${signal.id}:${device.token}`;
+      if (alreadyNotifiedIds.has(dispatchId)) {
+        skippedDuplicate++;
+        continue;
+      }
+
+      // Skip si dailyCap atteint (compter les dispatchs des dernières 24h)
+      const cap = prefs.dailyCap ?? 5;
+      if (cap > 0) {
+        const { count } = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM push_dispatch_log WHERE token = ? AND created_at > ?'
+        ).bind(device.token, cutoff24h).first<{ count: number }>() ?? { count: 0 };
+
+        if (count >= cap) {
+          skippedCap++;
+          continue;
+        }
+      }
+
+      // Construire le message
+      const title = `📈 ${signal.title.slice(0, 80)}`;
+      const body = signal.summary
+        ? signal.summary.slice(0, 120)
+        : `Signal émergent · ${signal.article_count} articles · croissance ${signal.growth_score}`;
+
+      messages.push({
+        to: device.token,
+        title,
+        body,
+        data: { type: 'signal', id: signal.id, theme: signal.main_theme ?? 'ai' },
+        channelId: 'alerts',
+      });
+
+      logEntries.push({
+        id: dispatchId,
+        token: device.token,
+        category: 'signal',
+        target_id: signal.id,
+        title: signal.title,
+        created_at: now,
+      });
+    }
+  }
+
+  // 4. Envoyer les notifications
+  if (messages.length > 0) {
+    await sendExpoPushMessages(messages);
+    console.log(`[Push/Signals] ${messages.length} notifications envoyées`);
+  }
+
+  // 5. Logger les dispatchs dans D1 (même si l'envoi a échoué, pour éviter les retries spammy)
+  if (logEntries.length > 0) {
+    const stmts = logEntries.map((entry) =>
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO push_dispatch_log (id, token, category, target_id, title, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(entry.id, entry.token, entry.category, entry.target_id, entry.title, entry.created_at)
+    );
+    await env.DB.batch(stmts);
+  }
+
+  const result = {
+    signalsFound: signals.length,
+    notified: messages.length,
+    skippedDuplicate,
+    skippedQuiet,
+    skippedCap,
+  };
+  console.log('[Push/Signals] Résultat:', result);
+  return result;
 }

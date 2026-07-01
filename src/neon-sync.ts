@@ -1,12 +1,10 @@
 /**
- * Neon sync — mirrors articles from D1 to Neon PostgreSQL.
+ * Database sync — mirrors articles from D1 to PostgreSQL (Neon).
  *
  * Uses @neondatabase/serverless (HTTP-based, works in Workers).
- * All articles are inserted in a SINGLE transaction to avoid the
- * 50-subrequest limit on Workers Free plan.
  *
  * Setup:
- *   wrangler secret put NEON_DATABASE_URL
+ *   wrangler secret put DATABASE_URL  (or NEON_DATABASE_URL)
  */
 
 import { neon } from '@neondatabase/serverless';
@@ -47,7 +45,7 @@ export async function syncToNeon(
   _sourceType: string,
   env: Env,
 ): Promise<number> {
-  const connStr = env.NEON_DATABASE_URL;
+  const connStr = env.DATABASE_URL ?? env.NEON_DATABASE_URL;
   if (!connStr || articles.length === 0) {
     return 0;
   }
@@ -55,7 +53,7 @@ export async function syncToNeon(
   const valid = articles.filter((a) => a.url && a.url.length > 0);
   if (valid.length === 0) return 0;
 
-  const sql = neon(connStr);
+  const sql = neon(connStr, { arrayMode: false, fullResults: false });
 
   try {
     // Build all insert statements for a single transaction
@@ -74,13 +72,12 @@ export async function syncToNeon(
       `;
     });
 
-    // Execute all inserts in a single transaction (1 HTTP round-trip)
     await sql.transaction(txStatements);
 
-    console.log(`[Neon] Synced ${valid.length} articles in 1 transaction`);
+    console.log(`[DB] Synced ${valid.length} articles in 1 transaction`);
     return valid.length;
   } catch (e) {
-    console.warn(`[Neon] Batch sync failed: ${e}`);
+    console.warn(`[DB] Batch sync failed: ${e}`);
     return 0;
   }
 }

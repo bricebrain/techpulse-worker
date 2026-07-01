@@ -681,11 +681,25 @@ async function cleanupOldPodcasts(env: Env): Promise<void> {
 
 async function notifyPodcastReady(env: Env, title: string, format: 'daily' | 'deep_dive'): Promise<void> {
   if (!env.DB) return;
-  const { results: devices } = await env.DB.prepare('SELECT token FROM devices').all<{ token: string }>();
+  const { results: devices } = await env.DB.prepare('SELECT token, preferences FROM devices').all<{ token: string; preferences: string | null }>();
   if (!devices.length) return;
 
   const isDeepDive = format === 'deep_dive';
-  const messages = devices.map((d) => ({
+
+  // Filtre les devices qui ont activé les notifications podcast (défaut: true)
+  const eligible = devices.filter((d) => {
+    if (!d.preferences) return true; // backward compat
+    try {
+      const prefs = JSON.parse(d.preferences) as { podcasts?: boolean };
+      return prefs.podcasts !== false;
+    } catch {
+      return true;
+    }
+  });
+
+  if (!eligible.length) return;
+
+  const messages = eligible.map((d) => ({
     to: d.token,
     title: isDeepDive ? '🔬 Deep Dive disponible' : '🎙 TechBrief du jour',
     body: title,

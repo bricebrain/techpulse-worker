@@ -24,8 +24,13 @@ CREATE TABLE IF NOT EXISTS articles (
   title_fr         TEXT,
   summary_fr       TEXT,
   published_at     INTEGER,
-  fetched_at       INTEGER NOT NULL
+  fetched_at       INTEGER NOT NULL,
+  audio_url        TEXT,             -- URL du fichier audio (épisodes podcast)
+  audio_duration   INTEGER           -- durée en secondes (podcasts)
 );
+-- Migration : ajouter les colonnes audio pour les bases existantes
+-- wrangler d1 execute techpulse --command="ALTER TABLE articles ADD COLUMN audio_url TEXT"
+-- wrangler d1 execute techpulse --command="ALTER TABLE articles ADD COLUMN audio_duration INTEGER"
 
 -- Cache d'embeddings pour recherche sémantique
 CREATE TABLE IF NOT EXISTS article_embeddings (
@@ -101,6 +106,41 @@ CREATE TABLE IF NOT EXISTS podcast_feed (
 );
 -- Migration pour les bases existantes (ignorer l'erreur si la colonne existe déjà)
 -- wrangler d1 execute techpulse --command="ALTER TABLE podcast_feed ADD COLUMN format TEXT NOT NULL DEFAULT 'daily'"
+
+-- Devices enregistrés pour les notifications push (Expo Push Token)
+-- Table créée historiquement hors schéma — recréée ici pour documentation.
+-- Pour les bases existantes, jouer la migration preferences ci-dessous.
+CREATE TABLE IF NOT EXISTS devices (
+  token        TEXT PRIMARY KEY,         -- Expo Push Token (16..4096 chars)
+  platform     TEXT NOT NULL DEFAULT 'unknown',  -- 'ios' | 'android' | 'unknown'
+  keywords     TEXT NOT NULL DEFAULT '[]',        -- JSON array de mots-clés (legacy + still used)
+  preferences  TEXT,                               -- JSON: { podcasts, signals, entities, keywords, quietHours, dailyCap }
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+-- Migration : ajouter la colonne preferences à la base existante
+-- wrangler d1 execute techpulse --command="ALTER TABLE devices ADD COLUMN preferences TEXT"
+
+-- Cache des réponses API v2 (réduit le data transfer Neon)
+-- Créé automatiquement par le Worker au premier accès
+CREATE TABLE IF NOT EXISTS api_cache (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- Une ligne = une notification envoyée à un device pour une cible donnée.
+CREATE TABLE IF NOT EXISTS push_dispatch_log (
+  id           TEXT NOT NULL,            -- `${category}:${target_id}:${token}` (clé anti-doublon)
+  token        TEXT NOT NULL,            -- device token
+  category     TEXT NOT NULL,            -- 'signal' | 'podcast' | 'keyword' | 'entity'
+  target_id    TEXT NOT NULL,            -- id du cluster/signal/entity/article
+  title        TEXT,                      -- titre affiché dans la notif (pour debug)
+  created_at   TEXT NOT NULL,
+  PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_push_dispatch_token_time ON push_dispatch_log(token, created_at);
+CREATE INDEX IF NOT EXISTS idx_push_dispatch_category_time ON push_dispatch_log(category, created_at);
 
 -- Index pour les requêtes fréquentes
 CREATE INDEX IF NOT EXISTS idx_articles_theme       ON articles(theme);

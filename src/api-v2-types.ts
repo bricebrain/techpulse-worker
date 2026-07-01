@@ -57,6 +57,8 @@ export interface ArticleDetailRow extends ArticleRow {
   embedding_model: string | null;
   embedding_dimensions: number | string | null;
   internal_score: number | string | null;
+  audio_url: string | null;
+  audio_duration: number | string | null;
   created_at: string | Date | null;
 }
 
