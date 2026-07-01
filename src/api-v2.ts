@@ -665,7 +665,7 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
 
   const [articles, analyses, entities, timeline] = await Promise.all([
      rows<ArticleRow>(sql`
-      SELECT a.id, a.title, a.title_fr, a.description, a.source_name, a.source_type,
+      SELECT a.id, a.title, a.description, a.source_name, a.source_type,
              a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
              a.external_score, a.comments_count, a.published_at, a.fetched_at,
              ca.role, ca.similarity_score
@@ -724,7 +724,7 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
 
 async function getArticleDetail(sql: Sql, articleId: string): Promise<Response> {
   const [article] = await rows<ArticleDetailRow>(sql`
-    SELECT a.id, a.title, a.title_fr, a.description, a.full_text, a.source_name, a.source_type,
+    SELECT a.id, a.title, a.description, a.full_text, a.source_name, a.source_type,
            a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
            a.external_score, a.comments_count, a.published_at, a.fetched_at,
            a.status, a.pipeline_status, a.extraction_status, a.embedding_status,
@@ -1231,7 +1231,7 @@ async function searchNeon(sql: Sql, url: URL): Promise<Response> {
 
   // Recherche sur les articles
   const articles = await rows<ArticleRow>(sql`
-    SELECT a.id, a.title, a.title_fr, a.description, a.source_name, a.source_type,
+    SELECT a.id, a.title, a.description, a.source_name, a.source_type,
            a.url, a.image_url, a.published_at
     FROM articles a
     WHERE a.title ILIKE ${ilikePattern}
