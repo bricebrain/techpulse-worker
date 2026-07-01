@@ -131,23 +131,6 @@ export interface EntityRow {
   seven_day_sources: number | string | null;
 }
 
-export interface EntityRelationshipRow {
-  id: string;
-  source_entity_id: string;
-  target_entity_id: string;
-  relation_type: string;
-  strength_score: number | string | null;
-  evidence_count: number | string | null;
-  evidence_cluster_ids: unknown;
-  evidence_article_ids: unknown;
-  evidence_summary: unknown;
-  first_seen_at: string | Date | null;
-  last_seen_at: string | Date | null;
-  updated_at: string | Date | null;
-  related_entity: unknown;
-  evidence_clusters: unknown;
-}
-
 export interface TimelineEventRow {
   id: string;
   title: string;

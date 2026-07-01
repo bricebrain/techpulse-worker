@@ -4,7 +4,6 @@ import type {
   ArticleIntelligenceRow,
   ArticleRow,
   ClusterRow,
-  EntityRelationshipRow,
   EntityRow,
 } from './api-v2-types';
 
@@ -163,24 +162,5 @@ export function normalizeEntity(row: EntityRow): JsonRecord {
     seven_day_sources: parseNumber(row.seven_day_sources),
     first_seen_at: toIso(row.first_seen_at),
     last_seen_at: toIso(row.last_seen_at),
-  };
-}
-
-export function normalizeEntityRelationship(row: EntityRelationshipRow): JsonRecord {
-  return {
-    id: row.id,
-    source_entity_id: row.source_entity_id,
-    target_entity_id: row.target_entity_id,
-    relation_type: row.relation_type,
-    strength_score: parseNumber(row.strength_score),
-    evidence_count: parseNumber(row.evidence_count),
-    evidence_cluster_ids: asArray(row.evidence_cluster_ids),
-    evidence_article_ids: asArray(row.evidence_article_ids),
-    evidence_summary: row.evidence_summary ?? {},
-    first_seen_at: toIso(row.first_seen_at),
-    last_seen_at: toIso(row.last_seen_at),
-    updated_at: toIso(row.updated_at),
-    related_entity: row.related_entity ?? null,
-    evidence_clusters: asArray(row.evidence_clusters),
   };
 }

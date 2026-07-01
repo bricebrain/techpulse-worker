@@ -610,6 +610,52 @@ export default {
       return resetRecentNeonAnalyses(env);
     }
 
+    // ── POST /admin/podcast/generate — podcast approfondi à la demande (clusters + science) ─
+    if (method === 'POST' && path === '/admin/podcast/generate') {
+      if (!hasAdminAccess()) return err('Non autorisé', 401);
+      let body: { topics?: { type: string; id: string }[]; target_minutes?: number };
+      try {
+        body = await req.json();
+      } catch {
+        return err('Corps JSON invalide', 400);
+      }
+      const topics = Array.isArray(body.topics)
+        ? body.topics.filter((t) => (t?.type === 'cluster' || t?.type === 'serendipity') && typeof t.id === 'string' && t.id)
+        : [];
+      if (!topics.length) return err('topics requis (au moins 1, {type, id})', 400);
+      const targetMinutes = body.target_minutes === 5 ? 5 : 10;
+
+      const token = env.GITHUB_TRIGGER_TOKEN;
+      const repo = env.INTELLIGENCE_REPO || 'braindevlopper-boop/techpulse-intelligence';
+      if (!token) {
+        return err('GITHUB_TRIGGER_TOKEN non configuré côté Worker — impossible de déclencher la génération', 500);
+      }
+
+      const topicsParam = topics.map((t) => `${t.type}:${t.id}`).join(',');
+      const ghResponse = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+        method: 'POST',
+        headers: {
+          Authorization: `token ${token}`,
+          Accept: 'application/vnd.github.v3+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'techpulse-worker',
+        },
+        body: JSON.stringify({
+          event_type: 'generate_podcast',
+          client_payload: { topics: topicsParam, target_minutes: targetMinutes },
+        }),
+      });
+
+      if (ghResponse.status !== 204) {
+        const detail = await ghResponse.text();
+        return err(`Échec du déclenchement GitHub (${ghResponse.status}): ${detail.slice(0, 300)}`, 502);
+      }
+
+      return json({
+        message: `Génération podcast approfondi lancée (${topics.length} sujet(s), ${targetMinutes} min) — disponible dans Podcasts sous quelques minutes.`,
+      });
+    }
+
     // ── GET /podcasts — liste des podcasts auto-générés ───────────────────
     if (method === 'GET' && path === '/podcasts') {
       const limit = Math.min(Number(url.searchParams.get('limit') ?? '7'), 20);

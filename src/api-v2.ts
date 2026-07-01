@@ -9,7 +9,6 @@ import {
   normalizeArticleIntelligence,
   normalizeCluster,
   normalizeEntity,
-  normalizeEntityRelationship,
   parseNumber,
   toIso,
 } from './api-v2-mappers';
@@ -20,7 +19,6 @@ import type {
   ArticleRow,
   ClusterRow,
   EntityRow,
-  EntityRelationshipRow,
   FeedClusterRow,
   TimelineEventRow,
 } from './api-v2-types';
@@ -310,6 +308,7 @@ const CACHE_FEED_TTL = 120 * ONE_MIN;      // Les clusters évoluent toutes les 
 const CACHE_PREFERENCES_TTL = 10 * ONE_MIN; // Les préférences changent avec les feedbacks
 const CACHE_ENTITIES_TTL = 60 * ONE_MIN;    // Les entités changent lentement
 const CACHE_SIGNALS_TTL = 30 * ONE_MIN;     // Les signaux émergent rapidement
+const CACHE_PODCAST_CANDIDATES_TTL = 15 * ONE_MIN; // Doit rester frais pour proposer les bons sujets
 const CACHE_PODCAST_MOMENTS_TTL = 120 * ONE_MIN; // Contenu podcast stable
 const CACHE_CONCEPTS_TTL = 120 * ONE_MIN;   // Concepts dynamiques, changent lentement
 const CACHE_PREDICTIONS_TTL = 60 * ONE_MIN; // Prédictions, pas urgent
@@ -317,13 +316,13 @@ const CACHE_SEARCH_TTL = 5 * ONE_MIN;       // Dépend de la query utilisateur
 const CACHE_SERENDIPITY_TTL = 120 * ONE_MIN;// Contenu scientifique stable
 const CACHE_CLUSTER_TTL = 30 * ONE_MIN;     // Détail cluster, change modérément
 const CACHE_ARTICLE_TTL = 60 * ONE_MIN;     // Détail article, change très peu
-const CACHE_ENTITY_GRAPH_TTL = 60 * ONE_MIN;
 
 const CACHE_TTL: Record<string, number> = {
   '/api/v2/feed': CACHE_FEED_TTL,
   '/api/v2/preferences': CACHE_PREFERENCES_TTL,
   '/api/v2/entities': CACHE_ENTITIES_TTL,
   '/api/v2/signals': CACHE_SIGNALS_TTL,
+  '/api/v2/podcast-candidates': CACHE_PODCAST_CANDIDATES_TTL,
   '/api/v2/podcast-moments': CACHE_PODCAST_MOMENTS_TTL,
   '/api/v2/concepts': CACHE_CONCEPTS_TTL,
   '/api/v2/predictions': CACHE_PREDICTIONS_TTL,
@@ -331,7 +330,6 @@ const CACHE_TTL: Record<string, number> = {
   '/api/v2/serendipity': CACHE_SERENDIPITY_TTL,
   '/api/v2/cluster/': CACHE_CLUSTER_TTL,
   '/api/v2/article/': CACHE_ARTICLE_TTL,
-  '/api/v2/entity/': CACHE_ENTITY_GRAPH_TTL,
 };
 
 function getCacheTtl(path: string): number {
@@ -425,15 +423,12 @@ export async function handleApiV2(req: Request, env: Env): Promise<Response | nu
       const id = decodeURIComponent(path.slice('/api/v2/article/'.length)).trim();
       if (!id) return err('ID article requis');
       response = await getArticleDetail(sql, id);
-    } else if (path.startsWith('/api/v2/entity/') && path.endsWith('/graph')) {
-      const rawId = path.slice('/api/v2/entity/'.length, -'/graph'.length);
-      const id = decodeURIComponent(rawId).trim();
-      if (!id) return err('ID entité requis');
-      response = await getEntityGraph(sql, id, url);
     } else if (path === '/api/v2/entities') {
       response = await getEntities(sql, url);
     } else if (path === '/api/v2/signals') {
       response = await getSignals(sql, url);
+    } else if (path === '/api/v2/podcast-candidates') {
+      response = await getPodcastCandidates(sql, url);
     } else if (path === '/api/v2/podcast-moments') {
       response = await getPodcastMoments(sql, url);
     } else if (path === '/api/v2/concepts') {
@@ -847,125 +842,85 @@ async function getEntities(sql: Sql, url: URL): Promise<Response> {
   return json({ entities, count: entities.length, source: 'neon' });
 }
 
-async function getEntityGraph(sql: Sql, entityId: string, url: URL): Promise<Response> {
-  const limit = parseLimit(url, 24, 60);
-  const [entity] = await rows<EntityRow>(sql`
-    SELECT e.id, e.name, e.normalized_name, e.type, e.description,
-           e.mentions_count, e.trend_score, e.first_seen_at, e.last_seen_at,
-           COALESCE(MAX(ts.growth_rate), 0) AS latest_growth_rate,
-           COALESCE(SUM(ts.mention_count), 0) AS seven_day_mentions,
-           COALESCE(SUM(ts.source_count), 0) AS seven_day_sources
-    FROM entities e
-    LEFT JOIN trend_snapshots ts ON ts.entity_id = e.id
-      AND ts.snapshot_date >= CURRENT_DATE - INTERVAL '7 days'
-    WHERE e.id = ${entityId}
-    GROUP BY e.id
-    LIMIT 1
-  `);
+interface PodcastCandidateRow {
+  id: string;
+  title: string;
+  summary: string | null;
+  main_theme: string | null;
+  importance_score: number | string;
+  growth_score: number | string;
+  novelty_score: number | string;
+  article_count: number | string;
+  score: number | string;
+}
 
-  if (!entity) return err('Entité introuvable', 404);
+interface PodcastSerendipityCandidateRow {
+  id: string;
+  title_choc: string;
+  enigme: string | null;
+  domain: string | null;
+}
 
-  const [relationshipTable] = await rows<{ exists: boolean }>(sql`
-    SELECT to_regclass('public.entity_relationships') IS NOT NULL AS exists
-  `);
+async function getPodcastCandidates(sql: Sql, url: URL): Promise<Response> {
+  const limit = parseLimit(url, 5, 10);
+  const clusterLimit = Math.ceil(limit * 0.7);
+  const scienceLimit = Math.max(1, limit - clusterLimit);
 
-  if (!relationshipTable?.exists) {
-    return json({
-      entity: normalizeEntity(entity),
-      relationships: [],
-      count: 0,
-      source: 'neon',
-      warning: 'entity_relationships table missing',
-    });
-  }
+  const [clusterRows, serendipityRows] = await Promise.all([
+    rows<PodcastCandidateRow>(sql`
+      SELECT c.id, c.title, c.summary, c.main_theme,
+             c.importance_score, c.growth_score, c.novelty_score, c.article_count,
+             (
+               c.importance_score
+               + LEAST(c.growth_score, 20) * 2
+               + c.novelty_score * 2
+               + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
+             ) AS score
+      FROM clusters c
+      WHERE c.status IN ('active', 'growing', 'peak')
+        AND c.article_count >= 2
+        AND NOT EXISTS (
+          SELECT 1 FROM podcasts p
+          WHERE p.created_at > NOW() - INTERVAL '48 hours'
+            AND p.cluster_ids @> to_jsonb(c.id::text)
+        )
+      ORDER BY score DESC
+      LIMIT ${clusterLimit}
+    `),
+    rows<PodcastSerendipityCandidateRow>(sql`
+      SELECT sc.id, sc.title_choc, sc.enigme, sc.domain
+      FROM serendipity_cards sc
+      WHERE sc.status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM podcasts p
+          WHERE p.created_at > NOW() - INTERVAL '48 hours'
+            AND p.cluster_ids @> to_jsonb(sc.id::text)
+        )
+      ORDER BY sc.created_at DESC
+      LIMIT ${scienceLimit}
+    `),
+  ]);
 
-  const relationships = await rows<EntityRelationshipRow>(sql`
-    SELECT
-      er.id,
-      er.source_entity_id,
-      er.target_entity_id,
-      er.relation_type,
-      er.strength_score,
-      er.evidence_count,
-      er.evidence_cluster_ids,
-      er.evidence_article_ids,
-      er.evidence_summary,
-      er.first_seen_at,
-      er.last_seen_at,
-      er.updated_at,
-      JSONB_BUILD_OBJECT(
-        'id', related.id,
-        'name', related.name,
-        'normalized_name', related.normalized_name,
-        'type', related.type,
-        'description', related.description,
-        'mentions_count', related.mentions_count,
-        'trend_score', related.trend_score,
-        'latest_growth_rate', COALESCE(related_ts.latest_growth_rate, 0),
-        'seven_day_mentions', COALESCE(related_ts.seven_day_mentions, 0),
-        'seven_day_sources', COALESCE(related_ts.seven_day_sources, 0),
-        'first_seen_at', related.first_seen_at,
-        'last_seen_at', related.last_seen_at
-      ) AS related_entity,
-      COALESCE((
-        SELECT JSONB_AGG(cluster_payload ORDER BY cluster_payload->>'last_updated_at' DESC NULLS LAST)
-        FROM (
-          SELECT JSONB_BUILD_OBJECT(
-            'id', c.id,
-            'title', c.title,
-            'summary', c.summary,
-            'main_theme', c.main_theme,
-            'status', c.status,
-            'importance_score', c.importance_score,
-            'growth_score', c.growth_score,
-            'novelty_score', c.novelty_score,
-            'source_diversity', c.source_diversity,
-            'article_count', c.article_count,
-            'score', (
-              c.importance_score
-              + LEAST(c.growth_score, 20) * 2
-              + c.novelty_score * 2
-              + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
-            ),
-            'first_seen_at', c.first_seen_at,
-            'last_updated_at', c.last_updated_at,
-            'created_at', c.created_at
-          ) AS cluster_payload
-          FROM clusters c
-          WHERE c.id IN (
-            SELECT JSONB_ARRAY_ELEMENTS_TEXT(er.evidence_cluster_ids)
-          )
-          ORDER BY c.last_updated_at DESC NULLS LAST
-          LIMIT 5
-        ) evidence
-      ), '[]'::jsonb) AS evidence_clusters
-    FROM entity_relationships er
-    JOIN entities related
-      ON related.id = CASE
-        WHEN er.source_entity_id = ${entityId} THEN er.target_entity_id
-        ELSE er.source_entity_id
-      END
-    LEFT JOIN LATERAL (
-      SELECT
-        COALESCE(MAX(ts.growth_rate), 0) AS latest_growth_rate,
-        COALESCE(SUM(ts.mention_count), 0) AS seven_day_mentions,
-        COALESCE(SUM(ts.source_count), 0) AS seven_day_sources
-      FROM trend_snapshots ts
-      WHERE ts.entity_id = related.id
-        AND ts.snapshot_date >= CURRENT_DATE - INTERVAL '7 days'
-    ) related_ts ON TRUE
-    WHERE er.source_entity_id = ${entityId}
-       OR er.target_entity_id = ${entityId}
-    ORDER BY er.strength_score DESC, er.evidence_count DESC, er.last_seen_at DESC NULLS LAST
-    LIMIT ${limit}
-  `);
+  const clusterCandidates = clusterRows.map((row) => ({
+    type: 'cluster' as const,
+    id: row.id,
+    title: row.title,
+    summary: row.summary,
+    main_theme: row.main_theme,
+    score: parseNumber(row.score),
+  }));
 
-  return json({
-    entity: normalizeEntity(entity),
-    relationships: relationships.map(normalizeEntityRelationship),
-    count: relationships.length,
-    source: 'neon',
-  });
+  const serendipityCandidates = serendipityRows.map((row) => ({
+    type: 'serendipity' as const,
+    id: row.id,
+    title: row.title_choc,
+    summary: row.enigme,
+    main_theme: row.domain,
+    score: null,
+  }));
+
+  const candidates = [...clusterCandidates, ...serendipityCandidates];
+  return json({ candidates, count: candidates.length, source: 'neon' });
 }
 
 async function getSignals(sql: Sql, url: URL): Promise<Response> {

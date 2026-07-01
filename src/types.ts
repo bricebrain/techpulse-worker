@@ -93,6 +93,8 @@ export interface Env {
   RUNPOD_AI_ENDPOINT_ID?: string;
   NEON_DATABASE_URL?: string;
   DATABASE_URL?: string; // Fallback alternatif (Supabase ou autre)
+  GITHUB_TRIGGER_TOKEN?: string; // PAT (repo scope) pour repository_dispatch vers techpulse-intelligence
+  INTELLIGENCE_REPO?: string;    // "owner/repo", défaut braindevlopper-boop/techpulse-intelligence
   PODCASTS?: R2Bucket;
 }
 
