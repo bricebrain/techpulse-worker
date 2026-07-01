@@ -23,6 +23,7 @@ export interface FeedClusterRow extends ClusterRow {
 export interface ArticleRow {
   id: string;
   title: string;
+  title_fr: string | null;
   description: string | null;
   source_name: string;
   source_type: string;

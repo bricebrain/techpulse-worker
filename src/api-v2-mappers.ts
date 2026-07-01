@@ -48,6 +48,7 @@ export function normalizeArticle(row: ArticleRow): JsonRecord {
   return {
     id: row.id,
     title: row.title,
+    title_fr: row.title_fr,
     description: row.description,
     source_name: row.source_name,
     source_type: row.source_type,

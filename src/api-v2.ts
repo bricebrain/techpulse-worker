@@ -305,20 +305,33 @@ function parseLimit(url: URL, defaultValue: number, max: number): number {
 
 // ─── D1 Cache (réduit le data transfer Neon) ──────────────────────────────────
 
+const ONE_MIN = 60;
+const CACHE_FEED_TTL = 120 * ONE_MIN;      // Les clusters évoluent toutes les 2-6h (pipeline tourne 3x/j) — était 10min, cause majeure d'egress Neon
+const CACHE_PREFERENCES_TTL = 10 * ONE_MIN; // Les préférences changent avec les feedbacks
+const CACHE_ENTITIES_TTL = 60 * ONE_MIN;    // Les entités changent lentement
+const CACHE_SIGNALS_TTL = 30 * ONE_MIN;     // Les signaux émergent rapidement
+const CACHE_PODCAST_MOMENTS_TTL = 120 * ONE_MIN; // Contenu podcast stable
+const CACHE_CONCEPTS_TTL = 120 * ONE_MIN;   // Concepts dynamiques, changent lentement
+const CACHE_PREDICTIONS_TTL = 60 * ONE_MIN; // Prédictions, pas urgent
+const CACHE_SEARCH_TTL = 5 * ONE_MIN;       // Dépend de la query utilisateur
+const CACHE_SERENDIPITY_TTL = 120 * ONE_MIN;// Contenu scientifique stable
+const CACHE_CLUSTER_TTL = 30 * ONE_MIN;     // Détail cluster, change modérément
+const CACHE_ARTICLE_TTL = 60 * ONE_MIN;     // Détail article, change très peu
+const CACHE_ENTITY_GRAPH_TTL = 60 * ONE_MIN;
+
 const CACHE_TTL: Record<string, number> = {
-  '/api/v2/feed': 600,           // 10 min (était 5 min)
-  '/api/v2/preferences': 600,    // 10 min (était 5 min)
-  '/api/v2/entities': 3600,      // 1h (était 30 min)
-  '/api/v2/signals': 1800,       // 30 min (était 15 min)
-  '/api/v2/podcast-moments': 7200, // 2h (était 1h)
-  '/api/v2/concepts': 7200,      // 2h (était 1h)
-  '/api/v2/predictions': 3600,   // 1h
-  '/api/v2/search': 300,         // 5 min (dépend de la query)
-  '/api/v2/serendipity': 7200,   // 2h (était 1h)
-  // Routes avec ID : TTL plus long (le contenu change peu)
-  '/api/v2/cluster/': 1800,      // 30 min (était 10 min)
-  '/api/v2/article/': 3600,      // 1h (était 30 min)
-  '/api/v2/entity/': 3600,       // 1h (était 30 min)
+  '/api/v2/feed': CACHE_FEED_TTL,
+  '/api/v2/preferences': CACHE_PREFERENCES_TTL,
+  '/api/v2/entities': CACHE_ENTITIES_TTL,
+  '/api/v2/signals': CACHE_SIGNALS_TTL,
+  '/api/v2/podcast-moments': CACHE_PODCAST_MOMENTS_TTL,
+  '/api/v2/concepts': CACHE_CONCEPTS_TTL,
+  '/api/v2/predictions': CACHE_PREDICTIONS_TTL,
+  '/api/v2/search': CACHE_SEARCH_TTL,
+  '/api/v2/serendipity': CACHE_SERENDIPITY_TTL,
+  '/api/v2/cluster/': CACHE_CLUSTER_TTL,
+  '/api/v2/article/': CACHE_ARTICLE_TTL,
+  '/api/v2/entity/': CACHE_ENTITY_GRAPH_TTL,
 };
 
 function getCacheTtl(path: string): number {
@@ -483,7 +496,10 @@ async function getPreferences(env: Env): Promise<Response> {
 
 async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
   const limit = parseLimit(url, 30, 100);
-  const candidateLimit = Math.min(240, Math.max(limit * 5, 80));
+  // Capped at 100 (was 240): candidates are re-ranked in JS (preference + freshness
+  // adjustments) then sliced to `limit` — fetching 240 full rows to keep ~30 was most
+  // of this endpoint's Neon egress. 100 still gives the re-ranker plenty of headroom.
+  const candidateLimit = Math.min(100, Math.max(limit * 5, 80));
   const preferenceProfile = await getArticleFeedbackPreferenceProfile(env);
   const result = await rows<FeedClusterRow>(sql`
     SELECT c.id, c.title, c.summary, c.main_theme, c.status,
@@ -502,21 +518,30 @@ async function getFeed(sql: Sql, env: Env, url: URL): Promise<Response> {
              + c.novelty_score * 2
              + CASE WHEN c.article_count >= 2 THEN 20 ELSE -15 END
            ) AS score,
+           -- Feed cards only ever read preview_articles[0].{category,image_url} (see
+           -- HomeClusterCard/ExplorerClusterCard) — fetch just that 1 article, trimmed columns,
+           -- instead of 3 full article rows (title_fr/description/url/sentiment were unused here).
            COALESCE((
              SELECT jsonb_agg(article_preview ORDER BY article_preview.published_at DESC NULLS LAST)
-             FROM (
-               SELECT a.id, a.title, a.description, a.source_name, a.source_type,
-                      a.url, a.image_url, a.category, a.sentiment, a.published_at,
-                      ca.role, ca.similarity_score
+              FROM (
+                SELECT a.id, a.title, a.source_name, a.image_url, a.category, a.published_at
                FROM cluster_articles ca
                JOIN articles a ON a.id = ca.article_id
                WHERE ca.cluster_id = c.id
                ORDER BY (ca.role = 'primary') DESC, a.published_at DESC NULLS LAST
-               LIMIT 3
+               LIMIT 1
              ) AS article_preview
            ), '[]'::jsonb) AS preview_articles,
+           -- Feed cards only read {summary,key_takeaways[0],risk_level} (see HomeClusterCard/
+           -- ExplorerClusterCard) — extract just those keys instead of the full analysis JSON
+           -- (pedagogical_analysis, risks, opportunities, timeline_events, counter_analysis, ...),
+           -- which is only needed on the cluster DETAIL screen (separate cached endpoint).
            (
-             SELECT aa.content
+             SELECT jsonb_build_object(
+               'summary', aa.content->'summary',
+               'key_takeaways', aa.content->'key_takeaways',
+               'risk_level', aa.content->'risk_level'
+             )
              FROM ai_analyses aa
              WHERE aa.target_type = 'cluster' AND aa.target_id = c.id
              ORDER BY aa.created_at DESC
@@ -644,8 +669,8 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
   if (!cluster) return err('Cluster introuvable', 404);
 
   const [articles, analyses, entities, timeline] = await Promise.all([
-    rows<ArticleRow>(sql`
-      SELECT a.id, a.title, a.description, a.source_name, a.source_type,
+     rows<ArticleRow>(sql`
+      SELECT a.id, a.title, a.title_fr, a.description, a.source_name, a.source_type,
              a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
              a.external_score, a.comments_count, a.published_at, a.fetched_at,
              ca.role, ca.similarity_score
@@ -704,7 +729,7 @@ async function getClusterDetail(sql: Sql, clusterId: string): Promise<Response> 
 
 async function getArticleDetail(sql: Sql, articleId: string): Promise<Response> {
   const [article] = await rows<ArticleDetailRow>(sql`
-    SELECT a.id, a.title, a.description, a.full_text, a.source_name, a.source_type,
+    SELECT a.id, a.title, a.title_fr, a.description, a.full_text, a.source_name, a.source_type,
            a.author, a.url, a.image_url, a.language, a.category, a.sentiment,
            a.external_score, a.comments_count, a.published_at, a.fetched_at,
            a.status, a.pipeline_status, a.extraction_status, a.embedding_status,
@@ -1251,7 +1276,7 @@ async function searchNeon(sql: Sql, url: URL): Promise<Response> {
 
   // Recherche sur les articles
   const articles = await rows<ArticleRow>(sql`
-    SELECT a.id, a.title, a.description, a.source_name, a.source_type,
+    SELECT a.id, a.title, a.title_fr, a.description, a.source_name, a.source_type,
            a.url, a.image_url, a.published_at
     FROM articles a
     WHERE a.title ILIKE ${ilikePattern}

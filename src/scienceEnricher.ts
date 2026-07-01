@@ -131,7 +131,15 @@ Réponds uniquement en JSON valide :
 }`;
 }
 
+function looksLikeBrokenJson(text: string): boolean {
+  // A malformed/truncated JSON.parse leaves the raw braces and keys in the
+  // text (e.g. `Voici la fiche : { "title_fr": "..."`). Never show that raw
+  // syntax to users — treat it as a parsing failure, not valid free prose.
+  return /"title_fr"\s*:|"summary_fr"\s*:|^\s*\{/.test(text);
+}
+
 function briefFromFreeText(text: string, article: ScienceArticleRow): ScienceBrief | null {
+  if (looksLikeBrokenJson(text)) return null;
   const summary = cleanText(
     text
       .replace(/```json/gi, '')
@@ -188,6 +196,48 @@ async function getXaiKey(env: Env): Promise<string> {
   }
 }
 
+async function getDeepseekKey(env: Env): Promise<string> {
+  try {
+    return await env.DEEPSEEK_API_KEY.get();
+  } catch {
+    return '';
+  }
+}
+
+// DeepSeek V4 Flash: near-zero cost ($0.14/$0.28 per M tokens) and reliable
+// strict-JSON output — used as a cheap, solid fallback before the weaker
+// Workers AI model, instead of discarding malformed briefs outright.
+async function generateWithDeepSeek(apiKey: string, article: ScienceArticleRow): Promise<ScienceBrief | null> {
+  if (!apiKey) return null;
+  try {
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        // Explicit model name — the "deepseek-chat" alias is deprecated 2026-07-24.
+        model: 'deepseek-v4-flash',
+        max_tokens: 1500,
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'Tu es un éditeur scientifique français. Réponds uniquement en JSON valide, sans markdown. Le champ summary_fr doit être entièrement en français.' },
+          { role: 'user', content: buildPrompt(article) },
+        ],
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!res.ok) {
+      console.warn(`[ScienceEnricher] DeepSeek HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json<{ choices?: { message?: { content?: string } }[] }>();
+    return parseBriefResponse(data.choices?.[0]?.message?.content ?? '', article);
+  } catch (e) {
+    console.warn('[ScienceEnricher] DeepSeek error:', e);
+    return null;
+  }
+}
+
 async function generateWithXai(apiKey: string, article: ScienceArticleRow): Promise<ScienceBrief | null> {
   if (!apiKey) return null;
   try {
@@ -196,7 +246,7 @@ async function generateWithXai(apiKey: string, article: ScienceArticleRow): Prom
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'grok-4',
-        max_tokens: 900,
+        max_tokens: 1500, // was 900: too tight for 6 French sections, caused JSON truncation
         temperature: 0.2,
         messages: [
           { role: 'system', content: 'Tu es un éditeur scientifique français. Réponds uniquement en JSON valide, sans markdown. Le champ summary_fr doit être entièrement en français.' },
@@ -302,7 +352,7 @@ async function generateWithGemini(apiKey: string, article: ScienceArticleRow): P
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: buildPrompt(article) }] }],
         generationConfig: {
-          maxOutputTokens: 900,
+          maxOutputTokens: 1500, // was 900: too tight for 6 French sections, caused JSON truncation
           temperature: 0.25,
           responseMimeType: 'application/json',
         },
@@ -325,7 +375,7 @@ async function generateWithWorkersAi(env: Env, article: ScienceArticleRow): Prom
   try {
     const response = await env.AI.run(MODEL, {
       messages: [{ role: 'user', content: buildPrompt(article) }],
-      max_tokens: 900,
+      max_tokens: 1500, // was 900: too tight for 6 French sections, caused JSON truncation
       temperature: 0.2,
     }) as { response?: string };
 
@@ -342,6 +392,7 @@ export async function enrichScienceArticles(
 ): Promise<number> {
   const xaiKey = await getXaiKey(env);
   const geminiKey = await getGeminiKey(env);
+  const deepseekKey = await getDeepseekKey(env);
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const limit = Math.max(1, Math.min(options.limit ?? MAX_ARTICLES_PER_RUN, 8));
   const summaryFilter = options.force ? '' : 'AND (summary_fr IS NULL OR LENGTH(summary_fr) < 120)';
@@ -386,6 +437,7 @@ export async function enrichScienceArticles(
     const needsWebSearch = cleanText(enrichedArticle.content, 5000).length < MIN_CONTEXT_FOR_STANDARD_GENERATION;
     const brief = (needsWebSearch ? await generateWithXaiWebSearch(xaiKey, enrichedArticle) : null)
       ?? await generateWithXai(xaiKey, enrichedArticle)
+      ?? await generateWithDeepSeek(deepseekKey, enrichedArticle)
       ?? await generateWithGemini(geminiKey, enrichedArticle)
       ?? await generateWithWorkersAi(env, enrichedArticle)
       ?? buildFallbackBrief(enrichedArticle);
